@@ -30,6 +30,7 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
+use serde::Deserialize;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -63,6 +64,20 @@ pub struct CodexAgent {
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
 const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpSessionMeta {
+    #[serde(default)]
+    system_prompt: Option<SystemPromptMeta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemPromptMeta {
+    #[serde(default)]
+    append: Option<String>,
+}
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -121,6 +136,7 @@ impl CodexAgent {
         &self,
         cwd: &Path,
         mcp_servers: Vec<McpServer>,
+        developer_instructions_append: Option<String>,
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
@@ -208,6 +224,13 @@ impl CodexAgent {
             .mcp_servers
             .set(new_mcp_servers)
             .map_err(|e| anyhow::anyhow!(e))?;
+
+        if let Some(merged) = merge_developer_instructions(
+            config.developer_instructions.take(),
+            developer_instructions_append,
+        ) {
+            config.developer_instructions = Some(merged);
+        }
 
         Ok(config)
     }
@@ -333,12 +356,14 @@ impl Agent for CodexAgent {
         // Check before sending if authentication was successful or not
         self.check_auth().await?;
 
+        let developer_instructions_append = parse_system_prompt_append(request.meta.as_ref());
         let NewSessionRequest {
             cwd, mcp_servers, ..
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config =
+            self.build_session_config(&cwd, mcp_servers, developer_instructions_append)?;
         let num_mcp_servers = config.mcp_servers.len();
 
         let NewThread {
@@ -408,7 +433,7 @@ impl Agent for CodexAgent {
             InitialHistory::New => Vec::new(),
         };
 
-        let config = self.build_session_config(&cwd, mcp_servers)?;
+        let config = self.build_session_config(&cwd, mcp_servers, None)?;
 
         let NewThread {
             thread_id: _,
@@ -680,5 +705,65 @@ fn format_session_title(message: &str) -> Option<String> {
         None
     } else {
         Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
+    }
+}
+
+fn parse_system_prompt_append(meta: Option<&agent_client_protocol::Meta>) -> Option<String> {
+    let meta = meta?;
+    let parsed: AcpSessionMeta =
+        serde_json::from_value(serde_json::Value::Object(meta.clone())).ok()?;
+    parsed
+        .system_prompt
+        .and_then(|system_prompt| system_prompt.append)
+        .map(|append| append.trim().to_string())
+        .filter(|append| !append.is_empty())
+}
+
+fn merge_developer_instructions(
+    existing: Option<String>,
+    appended: Option<String>,
+) -> Option<String> {
+    let appended = appended
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+
+    match existing
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(existing) => Some(format!("{existing}\n\n{appended}")),
+        None => Some(appended),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_developer_instructions, parse_system_prompt_append};
+
+    #[test]
+    fn parses_system_prompt_append_from_acp_meta() {
+        let meta = agent_client_protocol::Meta::from_iter([(
+            "systemPrompt".to_string(),
+            serde_json::json!({
+                "append": "Rename the branch",
+            }),
+        )]);
+
+        assert_eq!(
+            parse_system_prompt_append(Some(&meta)).as_deref(),
+            Some("Rename the branch"),
+        );
+    }
+
+    #[test]
+    fn merges_appended_developer_instructions() {
+        assert_eq!(
+            merge_developer_instructions(
+                Some("Existing developer policy".to_string()),
+                Some("Rename the branch".to_string()),
+            )
+            .as_deref(),
+            Some("Existing developer policy\n\nRename the branch"),
+        );
     }
 }
