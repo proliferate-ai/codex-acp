@@ -115,7 +115,7 @@ impl ModelsManagerImpl for ModelsManager {
     }
 
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        self.list_collaboration_modes()
+        ModelsManager::list_collaboration_modes(self)
     }
 }
 
