@@ -31,7 +31,9 @@ use codex_core::{
 };
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
-    config_types::TrustLevel,
+    config_types::{
+        CollaborationMode, CollaborationModeMask, ModeKind, ServiceTier, Settings, TrustLevel,
+    },
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     mcp::CallToolResult,
@@ -98,6 +100,7 @@ impl CodexThreadImpl for CodexThread {
 pub trait ModelsManagerImpl {
     async fn get_model(&self, model_id: &Option<String>) -> String;
     async fn list_models(&self) -> Vec<ModelPreset>;
+    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask>;
 }
 
 #[async_trait::async_trait]
@@ -109,6 +112,10 @@ impl ModelsManagerImpl for ModelsManager {
 
     async fn list_models(&self) -> Vec<ModelPreset> {
         self.list_models(RefreshStrategy::OnlineIfUncached).await
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+        self.list_collaboration_modes()
     }
 }
 
@@ -356,6 +363,38 @@ fn exec_request_key(call_id: &str) -> String {
 
 fn patch_request_key(call_id: &str) -> String {
     format!("patch:{call_id}")
+}
+
+fn fallback_model_display_name(model_id: &str) -> String {
+    let base = model_id
+        .split('[')
+        .next()
+        .unwrap_or(model_id)
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id);
+
+    if let Some(rest) = base.strip_prefix("gpt-") {
+        let mut parts = rest.split('-');
+        let version = parts.next().unwrap_or_default();
+        let suffix = parts.map(|part| part.to_title_case()).join(" ");
+        return if suffix.is_empty() {
+            format!("GPT {version}")
+        } else {
+            format!("GPT {version} {suffix}")
+        };
+    }
+
+    base.split('-').map(|part| part.to_title_case()).join(" ")
+}
+
+fn collaboration_mode_value(mode: ModeKind) -> &'static str {
+    match mode {
+        ModeKind::Plan => "plan",
+        ModeKind::Default => "default",
+        ModeKind::PairProgramming => "pair_programming",
+        ModeKind::Execute => "execute",
+    }
 }
 
 fn permissions_request_key(call_id: &str) -> String {
@@ -2195,6 +2234,8 @@ struct ThreadActor<A> {
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// The current collaboration mode as understood by Codex.
+    current_collaboration_mode: Option<CollaborationMode>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -2226,6 +2267,7 @@ impl<A: Auth> ThreadActor<A> {
             config,
             custom_prompts: Rc::default(),
             models_manager,
+            current_collaboration_mode: None,
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -2496,6 +2538,40 @@ impl<A: Auth> ThreadActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
+    async fn get_current_collaboration_mode(&mut self) -> CollaborationMode {
+        if let Some(mode) = &self.current_collaboration_mode {
+            return mode.clone();
+        }
+
+        let mode = CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: self.get_current_model().await,
+                reasoning_effort: self.config.model_reasoning_effort,
+                developer_instructions: None,
+            },
+        };
+        self.current_collaboration_mode = Some(mode.clone());
+        mode
+    }
+
+    fn update_current_collaboration_mode(
+        &mut self,
+        model: Option<String>,
+        effort: Option<Option<ReasoningEffort>>,
+    ) {
+        if let Some(current_mode) = self.current_collaboration_mode.clone() {
+            self.current_collaboration_mode =
+                Some(current_mode.with_updates(model, effort, /*developer_instructions*/ None));
+        }
+    }
+
+    fn sync_config_from_collaboration_mode(&mut self, mode: &CollaborationMode) {
+        self.config.model = Some(mode.model().to_string());
+        self.config.model_reasoning_effort = mode.reasoning_effort();
+        self.current_collaboration_mode = Some(mode.clone());
+    }
+
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
         let mut options = Vec::new();
 
@@ -2518,6 +2594,50 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
+        let collaboration_modes = self
+            .models_manager
+            .list_collaboration_modes()
+            .into_iter()
+            .filter(|mask| mask.mode.is_some_and(ModeKind::is_tui_visible))
+            .collect::<Vec<_>>();
+        if !collaboration_modes.is_empty() {
+            let current_collaboration_mode =
+                self.current_collaboration_mode
+                    .clone()
+                    .unwrap_or(CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
+                            model: self.get_current_model().await,
+                            reasoning_effort: self.config.model_reasoning_effort,
+                            developer_instructions: None,
+                        },
+                    });
+
+            let collaboration_mode_select_options = collaboration_modes
+                .into_iter()
+                .filter_map(|mask| {
+                    let mode = mask.mode?;
+                    Some(SessionConfigSelectOption::new(
+                        collaboration_mode_value(mode),
+                        mask.name,
+                    ))
+                })
+                .collect::<Vec<_>>();
+
+            options.push(
+                SessionConfigOption::select(
+                    "collaboration_mode",
+                    "Collaboration Mode",
+                    collaboration_mode_value(current_collaboration_mode.mode),
+                    collaboration_mode_select_options,
+                )
+                .category(SessionConfigOptionCategory::Other(
+                    "collaboration_mode".to_string(),
+                ))
+                .description("Choose how Codex should collaborate with you"),
+            );
+        }
+
         let presets = self.models_manager.list_models().await;
 
         let current_model = self.get_current_model().await;
@@ -2526,10 +2646,10 @@ impl<A: Auth> ThreadActor<A> {
         let mut model_select_options = Vec::new();
 
         if current_preset.is_none() {
-            // If no preset found, return the current model string as-is
+            // If no preset found, still present a human-friendly display label.
             model_select_options.push(SessionConfigSelectOption::new(
                 current_model.clone(),
-                current_model.clone(),
+                fallback_model_display_name(&current_model),
             ));
         };
 
@@ -2588,6 +2708,28 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
+        let fast_mode_select_options = vec![
+            SessionConfigSelectOption::new("off", "Off")
+                .description("Use Codex's default service tier"),
+            SessionConfigSelectOption::new("on", "On")
+                .description("Request the fast Codex service tier"),
+        ];
+        let fast_mode_current_value = if self.config.service_tier == Some(ServiceTier::Fast) {
+            "on"
+        } else {
+            "off"
+        };
+        options.push(
+            SessionConfigOption::select(
+                "fast_mode",
+                "Fast Mode",
+                fast_mode_current_value,
+                fast_mode_select_options,
+            )
+            .category(SessionConfigOptionCategory::Other("fast_mode".to_string()))
+            .description("Choose whether Codex should use fast mode"),
+        );
+
         Ok(options)
     }
 
@@ -2621,10 +2763,51 @@ impl<A: Auth> ThreadActor<A> {
         };
         match config_id.0.as_ref() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
+            "collaboration_mode" => self.handle_set_config_collaboration_mode(value).await,
             "model" => self.handle_set_config_model(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
+            "fast_mode" => self.handle_set_config_fast_mode(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
+    }
+
+    async fn handle_set_config_collaboration_mode(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let requested_mode: ModeKind =
+            serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
+        let mode_mask = self
+            .models_manager
+            .list_collaboration_modes()
+            .into_iter()
+            .find(|mask| mask.mode == Some(requested_mode))
+            .ok_or_else(|| Error::invalid_params().data("Unsupported collaboration mode"))?;
+
+        let next_mode = self
+            .get_current_collaboration_mode()
+            .await
+            .apply_mask(&mode_mask);
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: Some(next_mode.clone()),
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.sync_config_from_collaboration_mode(&next_mode);
+
+        Ok(())
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
@@ -2674,6 +2857,7 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
+        self.update_current_collaboration_mode(Some(model_to_use.clone()), Some(effort_to_use));
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
 
@@ -2720,7 +2904,39 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
+        self.update_current_collaboration_mode(None, Some(Some(effort)));
         self.config.model_reasoning_effort = Some(effort);
+
+        Ok(())
+    }
+
+    async fn handle_set_config_fast_mode(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let service_tier = match value.0.as_ref() {
+            "on" => Some(ServiceTier::Fast),
+            "off" => None,
+            _ => return Err(Error::invalid_params().data("Unsupported fast mode value")),
+        };
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: Some(service_tier),
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = service_tier;
 
         Ok(())
     }
@@ -2732,9 +2948,12 @@ impl<A: Auth> ThreadActor<A> {
         let current_model_id = if let Some(model_id) = self.find_current_model().await {
             model_id
         } else {
-            // If no preset found, return the current model string as-is
+            // If no preset found, still present a human-friendly display label.
             let model_id = ModelId::new(self.get_current_model().await);
-            available_models.push(ModelInfo::new(model_id.clone(), model_id.to_string()));
+            available_models.push(ModelInfo::new(
+                model_id.clone(),
+                fallback_model_display_name(&model_id.0),
+            ));
             model_id
         };
 
@@ -2966,6 +3185,7 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
+        self.update_current_collaboration_mode(Some(model_to_use.clone()), Some(effort_to_use));
         self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
 
@@ -3972,6 +4192,166 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_config_options_include_collaboration_and_fast_mode() -> anyhow::Result<()> {
+        let (_, _, _, message_tx, local_set) = setup(vec![]).await?;
+        local_set
+            .run_until(async move {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+                message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+                let config_options = response_rx.await??;
+
+                let collaboration_mode = config_options
+                    .iter()
+                    .find(|option| option.id.0.as_ref() == "collaboration_mode")
+                    .expect("collaboration mode config option");
+                assert_eq!(collaboration_mode.name, "Collaboration Mode");
+
+                let fast_mode = config_options
+                    .iter()
+                    .find(|option| option.id.0.as_ref() == "fast_mode")
+                    .expect("fast mode config option");
+                assert_eq!(fast_mode.name, "Fast Mode");
+
+                drop(message_tx);
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_collaboration_mode_submits_override() -> anyhow::Result<()> {
+        let (_, _, thread, message_tx, local_set) = setup(vec![]).await?;
+        local_set
+            .run_until(async move {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+                message_tx.send(ThreadMessage::SetConfigOption {
+                    config_id: SessionConfigId::new("collaboration_mode"),
+                    value: SessionConfigOptionValue::ValueId {
+                        value: SessionConfigValueId::new("plan"),
+                    },
+                    response_tx,
+                })?;
+                response_rx.await??;
+
+                let (options_tx, options_rx) = tokio::sync::oneshot::channel();
+                message_tx.send(ThreadMessage::GetConfigOptions {
+                    response_tx: options_tx,
+                })?;
+                let config_options = options_rx.await??;
+                let collaboration_mode = config_options
+                    .iter()
+                    .find(|option| option.id.0.as_ref() == "collaboration_mode")
+                    .expect("collaboration mode config option");
+                let agent_client_protocol::SessionConfigKind::Select(select) =
+                    &collaboration_mode.kind
+                else {
+                    panic!("expected select config option");
+                };
+                assert_eq!(select.current_value.0.as_ref(), "plan");
+
+                drop(message_tx);
+                anyhow::Ok(())
+            })
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::OverrideTurnContext { collaboration_mode: Some(mode), .. })
+                if mode.mode == ModeKind::Plan
+                    && mode.reasoning_effort() == Some(ReasoningEffort::Medium)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_fast_mode_submits_override() -> anyhow::Result<()> {
+        let (_, _, thread, message_tx, local_set) = setup(vec![]).await?;
+        local_set
+            .run_until(async move {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+                message_tx.send(ThreadMessage::SetConfigOption {
+                    config_id: SessionConfigId::new("fast_mode"),
+                    value: SessionConfigOptionValue::ValueId {
+                        value: SessionConfigValueId::new("on"),
+                    },
+                    response_tx,
+                })?;
+                response_rx.await??;
+
+                drop(message_tx);
+                anyhow::Ok(())
+            })
+            .await?;
+
+        let ops = thread.ops.lock().unwrap();
+        assert!(matches!(
+            ops.last(),
+            Some(Op::OverrideTurnContext {
+                service_tier: Some(Some(ServiceTier::Fast)),
+                ..
+            })
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_persists_across_reasoning_effort_changes() -> anyhow::Result<()> {
+        let (_, _, _, message_tx, local_set) = setup(vec![]).await?;
+        local_set
+            .run_until(async move {
+                let (plan_tx, plan_rx) = tokio::sync::oneshot::channel();
+                message_tx.send(ThreadMessage::SetConfigOption {
+                    config_id: SessionConfigId::new("collaboration_mode"),
+                    value: SessionConfigOptionValue::ValueId {
+                        value: SessionConfigValueId::new("plan"),
+                    },
+                    response_tx: plan_tx,
+                })?;
+                plan_rx.await??;
+
+                let (effort_tx, effort_rx) = tokio::sync::oneshot::channel();
+                message_tx.send(ThreadMessage::SetConfigOption {
+                    config_id: SessionConfigId::new("reasoning_effort"),
+                    value: SessionConfigOptionValue::ValueId {
+                        value: SessionConfigValueId::new("high"),
+                    },
+                    response_tx: effort_tx,
+                })?;
+                effort_rx.await??;
+
+                let (options_tx, options_rx) = tokio::sync::oneshot::channel();
+                message_tx.send(ThreadMessage::GetConfigOptions {
+                    response_tx: options_tx,
+                })?;
+                let config_options = options_rx.await??;
+                let collaboration_mode = config_options
+                    .iter()
+                    .find(|option| option.id.0.as_ref() == "collaboration_mode")
+                    .expect("collaboration mode config option");
+                let agent_client_protocol::SessionConfigKind::Select(select) =
+                    &collaboration_mode.kind
+                else {
+                    panic!("expected select config option");
+                };
+                assert_eq!(select.current_value.0.as_ref(), "plan");
+
+                drop(message_tx);
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
     async fn setup(
         custom_prompts: Vec<CustomPrompt>,
     ) -> anyhow::Result<(
@@ -4030,6 +4410,25 @@ mod tests {
 
         async fn list_models(&self) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
+        }
+
+        fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+            vec![
+                CollaborationModeMask {
+                    name: "Default".to_string(),
+                    mode: Some(ModeKind::Default),
+                    model: None,
+                    reasoning_effort: None,
+                    developer_instructions: Some(Some("Default mode".to_string())),
+                },
+                CollaborationModeMask {
+                    name: "Plan".to_string(),
+                    mode: Some(ModeKind::Plan),
+                    model: None,
+                    reasoning_effort: Some(Some(ReasoningEffort::Medium)),
+                    developer_instructions: Some(Some("Plan mode".to_string())),
+                },
+            ]
         }
     }
 
@@ -4308,6 +4707,7 @@ mod tests {
                 | Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
                 | Op::PatchApproval { .. }
+                | Op::OverrideTurnContext { .. }
                 | Op::Interrupt => {}
                 Op::Shutdown => {
                     if let Some(active_prompt_id) = self.active_prompt_id.lock().unwrap().take() {
