@@ -53,7 +53,7 @@ OPENAI_API_KEY=sk-... codex-acp
 Or via npm:
 
 ```
-npx @proliferate/codex-acp
+npx @proliferateai/codex-acp
 ```
 
 ## License

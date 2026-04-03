@@ -36,7 +36,7 @@ function getPlatformPackage() {
     process.exit(1);
   }
 
-  return `@proliferate/${packageName}`;
+  return `@proliferateai/${packageName}`;
 }
 
 // Locate the binary

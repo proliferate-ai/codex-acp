@@ -1,5 +1,5 @@
 {
-  "name": "@proliferate/${PACKAGE_NAME}",
+  "name": "@proliferateai/${PACKAGE_NAME}",
   "version": "${VERSION}",
   "description": "An ACP-compatible coding agent powered by Codex - ${OS} ${ARCH} binary",
   "license": "Apache-2.0",
