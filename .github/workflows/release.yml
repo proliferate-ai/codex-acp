@@ -221,8 +221,26 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Detect macOS signing configuration
+        id: macos_signing
+        if: startsWith(matrix.os, 'macos')
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${MACOS_CERTIFICATE}" && -n "${MACOS_CERTIFICATE_PASSWORD}" && -n "${APPLE_NOTARIZATION_KEY}" && -n "${APPLE_NOTARIZATION_KEY_ID}" && -n "${APPLE_NOTARIZATION_ISSUER_ID}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Code sign macOS binary
-        if: startsWith(matrix.os, 'macos') && secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.APPLE_NOTARIZATION_KEY != '' && secrets.APPLE_NOTARIZATION_KEY_ID != '' && secrets.APPLE_NOTARIZATION_ISSUER_ID != ''
+        if: startsWith(matrix.os, 'macos') && steps.macos_signing.outputs.enabled == 'true'
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -232,8 +250,27 @@ jobs:
         run: |
           ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
 
+      - name: Detect Windows signing configuration
+        id: windows_signing
+        if: startsWith(matrix.os, 'windows')
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+          ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          CERT_PROFILE_NAME: ${{ vars.AZURE_SIGNING_CERT_PROFILE_NAME }}
+          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${AZURE_TENANT_ID}" && -n "${AZURE_CLIENT_ID}" && -n "${AZURE_CLIENT_SECRET}" && -n "${ACCOUNT_NAME}" && -n "${CERT_PROFILE_NAME}" && -n "${ENDPOINT}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Code sign Windows binary
-        if: startsWith(matrix.os, 'windows') && secrets.AZURE_SIGNING_TENANT_ID != '' && secrets.AZURE_SIGNING_CLIENT_ID != '' && secrets.AZURE_SIGNING_CLIENT_SECRET != '' && vars.AZURE_SIGNING_ACCOUNT_NAME != '' && vars.AZURE_SIGNING_CERT_PROFILE_NAME != '' && vars.AZURE_SIGNING_ENDPOINT != ''
+        if: startsWith(matrix.os, 'windows') && steps.windows_signing.outputs.enabled == 'true'
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
