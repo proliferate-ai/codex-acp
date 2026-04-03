@@ -47,38 +47,17 @@ jobs:
   build:
     name: Build - ${{ matrix.os }}
     needs: get-version
-    if: >-
-      ${{
-        github.event.inputs.publish_profile != 'linux-x64' ||
-        matrix.target == 'x86_64-unknown-linux-gnu'
-      }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            binary_extension: ""
-          - os: macos-14
-            target: x86_64-apple-darwin
-            binary_extension: ""
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            binary_extension: ""
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            binary_extension: ""
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            binary_extension: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary_extension: ".exe"
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            binary_extension: ".exe"
+        include: >-
+          ${{
+            fromJSON(
+              github.event.inputs.publish_profile == 'linux-x64' &&
+              '[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_extension":""}]' ||
+              '[{"os":"macos-14","target":"aarch64-apple-darwin","binary_extension":""},{"os":"macos-14","target":"x86_64-apple-darwin","binary_extension":""},{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_extension":""},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","binary_extension":""},{"os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-musl","binary_extension":""},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_extension":".exe"},{"os":"windows-11-arm","target":"aarch64-pc-windows-msvc","binary_extension":".exe"}]'
+            )
+          }}
 
     runs-on: ${{ matrix.os }}
 
