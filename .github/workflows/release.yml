@@ -7,6 +7,14 @@ on:
         description: "Tag name for release (optional - uses version from Cargo.toml if not specified)"
         required: false
         type: string
+      publish_profile:
+        description: "Artifact profile to publish"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - linux-x64
 
 permissions:
   contents: write
@@ -39,6 +47,11 @@ jobs:
   build:
     name: Build - ${{ matrix.os }}
     needs: get-version
+    if: >-
+      ${{
+        github.event.inputs.publish_profile != 'linux-x64' ||
+        matrix.target == 'x86_64-unknown-linux-gnu'
+      }}
     strategy:
       fail-fast: false
       matrix:
