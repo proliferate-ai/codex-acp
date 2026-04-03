@@ -222,7 +222,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Code sign macOS binary
-        if: startsWith(matrix.os, 'macos')
+        if: startsWith(matrix.os, 'macos') && secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.APPLE_NOTARIZATION_KEY != '' && secrets.APPLE_NOTARIZATION_KEY_ID != '' && secrets.APPLE_NOTARIZATION_ISSUER_ID != ''
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -233,7 +233,7 @@ jobs:
           ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
 
       - name: Code sign Windows binary
-        if: startsWith(matrix.os, 'windows')
+        if: startsWith(matrix.os, 'windows') && secrets.AZURE_SIGNING_TENANT_ID != '' && secrets.AZURE_SIGNING_CLIENT_ID != '' && secrets.AZURE_SIGNING_CLIENT_SECRET != '' && vars.AZURE_SIGNING_ACCOUNT_NAME != '' && vars.AZURE_SIGNING_CERT_PROFILE_NAME != '' && vars.AZURE_SIGNING_ENDPOINT != ''
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
@@ -324,7 +324,7 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -351,7 +351,7 @@ jobs:
             if [ -d "$pkg" ]; then
               echo "Publishing $(basename $pkg)..."
               cd "$pkg"
-              npm publish
+              npm publish --access public
               cd ../..
             fi
           done
@@ -360,7 +360,7 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -389,7 +389,7 @@ jobs:
       - name: Publish base package
         run: |
           cd npm
-          npm publish
+          npm publish --access public
 
   create-release:
     name: Create Release
