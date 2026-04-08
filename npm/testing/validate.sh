@@ -101,6 +101,21 @@ if [ $missing_packages -eq 0 ]; then
 else
   exit 1
 fi
+
+mismatched_versions=0
+for pkg in "${EXPECTED_PACKAGES[@]}"; do
+  pkg_version=$(node -p "require('./npm/package.json').optionalDependencies['$pkg']")
+  if [ "$pkg_version" != "$NPM_VERSION" ]; then
+    echo -e "${RED}✗ Optional dependency version mismatch for $pkg: expected $NPM_VERSION got $pkg_version${NC}"
+    mismatched_versions=1
+  fi
+done
+
+if [ $mismatched_versions -eq 0 ]; then
+  echo -e "${GREEN}✓ All platform package versions match the base package version${NC}"
+else
+  exit 1
+fi
 echo
 
 # 6. Verify platform package generation script end-to-end
