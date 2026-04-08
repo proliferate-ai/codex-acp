@@ -308,6 +308,7 @@ jobs:
     name: Create NPM Packages
     needs: [get-version, build]
     runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.publish_profile == 'all' }}
     outputs:
       packages: ${{ steps.create_packages.outputs.packages }}
 
@@ -335,6 +336,9 @@ jobs:
       - name: Update base package version
         run: bash npm/publish/update-base-package.sh ${{ needs.get-version.outputs.version }}
 
+      - name: Validate npm packaging
+        run: bash npm/testing/validate.sh
+
       - name: Upload NPM packages
         uses: actions/upload-artifact@v4
         with:
@@ -353,7 +357,7 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' }}
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event.inputs.publish_profile == 'all' }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -389,7 +393,7 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' }}
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event.inputs.publish_profile == 'all' }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -424,6 +428,7 @@ jobs:
     name: Create Release
     needs: [get-version, build, publish-npm-base]
     runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.publish_profile == 'all' }}
 
     steps:
       - uses: actions/checkout@v4
