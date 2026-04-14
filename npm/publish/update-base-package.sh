@@ -19,19 +19,19 @@ if [[ ! -f "$PACKAGE_JSON" ]]; then
   exit 1
 fi
 
-# Update version in base package.json
-sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$PACKAGE_JSON"
+node --input-type=module - "$PACKAGE_JSON" "$VERSION" <<'EOF'
+import fs from "node:fs";
 
-# Update optionalDependencies versions
-sed -i.bak "s/\"codex-acp-darwin-arm64\": \".*\"/\"codex-acp-darwin-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-darwin-x64\": \".*\"/\"codex-acp-darwin-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-linux-arm64\": \".*\"/\"codex-acp-linux-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-linux-x64\": \".*\"/\"codex-acp-linux-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-win32-arm64\": \".*\"/\"codex-acp-win32-arm64\": \"$VERSION\"/" "$PACKAGE_JSON"
-sed -i.bak "s/\"codex-acp-win32-x64\": \".*\"/\"codex-acp-win32-x64\": \"$VERSION\"/" "$PACKAGE_JSON"
+const [packageJsonPath, version] = process.argv.slice(2);
+const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+packageJson.version = version;
 
-# Remove backup file
-rm -f "$PACKAGE_JSON.bak"
+for (const dependencyName of Object.keys(packageJson.optionalDependencies ?? {})) {
+  packageJson.optionalDependencies[dependencyName] = version;
+}
+
+fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+EOF
 
 echo "✅ Updated package.json:"
 cat "$PACKAGE_JSON"
