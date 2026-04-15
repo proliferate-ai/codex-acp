@@ -62,6 +62,7 @@ use codex_protocol::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
     },
+    request_user_input::{RequestUserInputEvent, RequestUserInputResponse},
     user_input::UserInput,
 };
 use codex_shell_command::parse_command::parse_command;
@@ -1587,6 +1588,14 @@ impl PromptState {
                     drop(response_tx.send(Err(err)));
                 }
             }
+            EventMsg::RequestUserInput(event) => {
+                self.diagnostics.note_event("request_user_input");
+                if let Err(err) = self.request_user_input(event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
             EventMsg::GuardianAssessment(event) => {
                 info!(
                     "Guardian assessment: id={}, status={:?}, turn_id={}",
@@ -1634,11 +1643,41 @@ impl PromptState {
             | EventMsg::ListSkillsResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            | EventMsg::DeprecationNotice(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    async fn request_user_input(&mut self, event: RequestUserInputEvent) -> Result<(), Error> {
+        let turn_id = if event.turn_id.is_empty() {
+            self.submission_id.clone()
+        } else {
+            event.turn_id.clone()
+        };
+        let question_count = event.questions.len();
+
+        // ACP does not currently model Codex's structured request_user_input
+        // form. Match Codex app-server's unsupported-client fallback: resolve
+        // with no answers so the turn cannot remain blocked indefinitely.
+        warn!(
+            call_id = %event.call_id,
+            turn_id = %turn_id,
+            question_count,
+            "request_user_input is not supported by ACP; submitting empty answer"
+        );
+
+        self.thread
+            .submit(Op::UserInputAnswer {
+                id: turn_id,
+                response: RequestUserInputResponse {
+                    answers: HashMap::new(),
+                },
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        Ok(())
     }
 
     async fn mcp_elicitation(
@@ -4480,6 +4519,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_user_input_submits_empty_answer() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::RequestUserInput(RequestUserInputEvent {
+                            call_id: "call-1".to_string(),
+                            turn_id: "turn-1".to_string(),
+                            questions: vec![
+                                codex_protocol::request_user_input::RequestUserInputQuestion {
+                                    id: "provider".to_string(),
+                                    header: "Provider".to_string(),
+                                    question: "Which provider should be used?".to_string(),
+                                    is_other: true,
+                                    is_secret: false,
+                                    options: Some(vec![
+                                        codex_protocol::request_user_input::RequestUserInputQuestionOption {
+                                            label: "Recommended".to_string(),
+                                            description: "Use the recommended provider".to_string(),
+                                        },
+                                    ]),
+                                },
+                            ],
+                        }),
+                    )
+                    .await;
+
+                let ops = thread.ops.lock().unwrap();
+                assert_eq!(ops.len(), 1);
+                let Op::UserInputAnswer { id, response } = &ops[0] else {
+                    panic!("expected UserInputAnswer op, got {:?}", ops[0]);
+                };
+                assert_eq!(id, "turn-1");
+                assert!(response.answers.is_empty());
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -5276,6 +5371,7 @@ mod tests {
                 Op::ExecApproval { .. }
                 | Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
+                | Op::UserInputAnswer { .. }
                 | Op::PatchApproval { .. }
                 | Op::Interrupt => {}
                 Op::Shutdown => {
