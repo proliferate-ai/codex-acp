@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use agent_client_protocol::{
@@ -35,6 +36,7 @@ use codex_protocol::{
     config_types::TrustLevel,
     custom_prompts::CustomPrompt,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
+    items::TurnItem,
     mcp::CallToolResult,
     models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
@@ -78,6 +80,8 @@ use crate::{
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+const ANYHARNESS_META_KEY: &str = "anyharness";
+const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 #[async_trait::async_trait]
@@ -680,6 +684,12 @@ impl SubmissionState {
         }
     }
 
+    fn log_pending_diagnostics(&self) {
+        if let Self::Prompt(state) = self {
+            state.log_pending_diagnostics();
+        }
+    }
+
     fn fail(&mut self, err: Error) {
         if let Self::Prompt(state) = self
             && let Some(response_tx) = state.response_tx.take()
@@ -730,6 +740,148 @@ struct ActiveCommand {
     file_extension: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PromptPlanStatusSummary {
+    pending: usize,
+    in_progress: usize,
+    completed: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PromptDiagnostics {
+    submitted_at: Instant,
+    current_turn_id: Option<String>,
+    last_event_kind: Option<&'static str>,
+    last_event_at: Option<Instant>,
+    last_agent_chunk_at: Option<Instant>,
+    last_agent_preview: Option<String>,
+    last_plan_at: Option<Instant>,
+    plan_statuses: PromptPlanStatusSummary,
+    turn_complete_seen_at: Option<Instant>,
+    response_sent_at: Option<Instant>,
+    stream_error_seen_at: Option<Instant>,
+}
+
+impl PromptDiagnostics {
+    fn new() -> Self {
+        Self {
+            submitted_at: Instant::now(),
+            current_turn_id: None,
+            last_event_kind: None,
+            last_event_at: None,
+            last_agent_chunk_at: None,
+            last_agent_preview: None,
+            last_plan_at: None,
+            plan_statuses: PromptPlanStatusSummary::default(),
+            turn_complete_seen_at: None,
+            response_sent_at: None,
+            stream_error_seen_at: None,
+        }
+    }
+
+    fn note_event(&mut self, kind: &'static str) {
+        self.last_event_kind = Some(kind);
+        self.last_event_at = Some(Instant::now());
+    }
+
+    fn note_turn_started(&mut self, turn_id: &str) {
+        self.current_turn_id = Some(turn_id.to_string());
+        self.note_event("turn_started");
+    }
+
+    fn note_agent_output(&mut self, kind: &'static str, text: &str) {
+        let now = Instant::now();
+        self.last_event_kind = Some(kind);
+        self.last_event_at = Some(now);
+        self.last_agent_chunk_at = Some(now);
+        self.last_agent_preview = Some(truncate_preview(text, 120));
+    }
+
+    fn note_plan_update(&mut self, plan: &[PlanItemArg]) {
+        self.note_event("plan_update");
+        self.last_plan_at = self.last_event_at;
+        self.plan_statuses = summarize_plan_statuses(plan);
+    }
+
+    fn note_stream_error(&mut self) {
+        self.note_event("stream_error");
+        self.stream_error_seen_at = self.last_event_at;
+    }
+
+    fn note_turn_complete(&mut self, turn_id: &str) {
+        self.current_turn_id = Some(turn_id.to_string());
+        self.note_event("turn_complete");
+        self.turn_complete_seen_at = self.last_event_at;
+    }
+
+    fn note_response_sent(&mut self) {
+        self.response_sent_at = Some(Instant::now());
+    }
+
+    fn log_pending(
+        &self,
+        submission_id: &str,
+        active_command_count: usize,
+        active_web_search: bool,
+        active_guardian_assessment_count: usize,
+        pending_permission_count: usize,
+        event_count: usize,
+    ) {
+        let now = Instant::now();
+        info!(
+            submission_id = submission_id,
+            turn_id = ?self.current_turn_id,
+            pending_for_ms = self.submitted_at.elapsed().as_millis() as u64,
+            event_count = event_count,
+            last_event_kind = ?self.last_event_kind,
+            last_event_age_ms = age_ms(self.last_event_at, now),
+            last_agent_chunk_age_ms = age_ms(self.last_agent_chunk_at, now),
+            last_agent_preview = self.last_agent_preview.as_deref().unwrap_or(""),
+            last_plan_age_ms = age_ms(self.last_plan_at, now),
+            turn_complete_seen_age_ms = age_ms(self.turn_complete_seen_at, now),
+            response_sent_age_ms = age_ms(self.response_sent_at, now),
+            stream_error_seen_age_ms = age_ms(self.stream_error_seen_at, now),
+            plan_pending = self.plan_statuses.pending,
+            plan_in_progress = self.plan_statuses.in_progress,
+            plan_completed = self.plan_statuses.completed,
+            active_command_count = active_command_count,
+            active_web_search = active_web_search,
+            active_guardian_assessment_count = active_guardian_assessment_count,
+            pending_permission_count = pending_permission_count,
+            "codex_acp.prompt.pending"
+        );
+    }
+}
+
+fn summarize_plan_statuses(plan: &[PlanItemArg]) -> PromptPlanStatusSummary {
+    let mut summary = PromptPlanStatusSummary::default();
+    for item in plan {
+        match item.status {
+            StepStatus::Pending => summary.pending += 1,
+            StepStatus::InProgress => summary.in_progress += 1,
+            StepStatus::Completed => summary.completed += 1,
+        }
+    }
+    summary
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut preview = String::new();
+    for ch in text.chars().take(max_chars) {
+        preview.push(ch);
+    }
+    if text.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn age_ms(since: Option<Instant>, now: Instant) -> u64 {
+    since
+        .map(|instant| now.saturating_duration_since(instant).as_millis() as u64)
+        .unwrap_or(0)
+}
+
 struct PromptState {
     submission_id: String,
     active_commands: HashMap<String, ActiveCommand>,
@@ -742,6 +894,8 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    agent_message_ids_by_item_id: HashMap<String, String>,
+    diagnostics: PromptDiagnostics,
 }
 
 impl PromptState {
@@ -763,6 +917,8 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            agent_message_ids_by_item_id: HashMap::new(),
+            diagnostics: PromptDiagnostics::new(),
         }
     }
 
@@ -773,10 +929,28 @@ impl PromptState {
         !response_tx.is_closed()
     }
 
+    fn agent_message_id_for_item(&mut self, item_id: &str) -> String {
+        self.agent_message_ids_by_item_id
+            .entry(item_id.to_string())
+            .or_insert_with(|| Uuid::new_v4().to_string())
+            .clone()
+    }
+
     fn abort_pending_interactions(&mut self) {
         for (_, interaction) in self.pending_permission_interactions.drain() {
             interaction.task.abort();
         }
+    }
+
+    fn log_pending_diagnostics(&self) {
+        self.diagnostics.log_pending(
+            &self.submission_id,
+            self.active_commands.len(),
+            self.active_web_search.is_some(),
+            self.active_guardian_assessments.len(),
+            self.pending_permission_interactions.len(),
+            self.event_count,
+        );
     }
 
     fn spawn_permission_request(
@@ -980,6 +1154,7 @@ impl PromptState {
                 collaboration_mode_kind,
                 turn_id,
             }) => {
+                self.diagnostics.note_turn_started(&turn_id);
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
             EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
@@ -995,6 +1170,7 @@ impl PromptState {
                     }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+                self.diagnostics.note_event("item_started");
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
@@ -1003,6 +1179,7 @@ impl PromptState {
                 text_elements: _,
                 local_images: _,
             }) => {
+                self.diagnostics.note_event("user_message");
                 info!("User message: {message:?}");
             }
             EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
@@ -1011,9 +1188,12 @@ impl PromptState {
                 item_id,
                 delta,
             }) => {
+                self.diagnostics
+                    .note_agent_output("agent_message_delta", &delta);
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text(delta).await;
+                let message_id = self.agent_message_id_for_item(&item_id);
+                client.send_agent_text_with_message_id(delta, message_id).await;
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -1029,6 +1209,7 @@ impl PromptState {
                 delta,
                 content_index: index,
             }) => {
+                self.diagnostics.note_event("reasoning_delta");
                 info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta).await;
@@ -1037,12 +1218,15 @@ impl PromptState {
                 item_id,
                 summary_index,
             }) => {
+                self.diagnostics.note_event("reasoning_section_break");
                 info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n").await;
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , phase: _, memory_citation: _ }) => {
+                self.diagnostics
+                    .note_agent_output("agent_message", &message);
                 info!("Agent message (non-delta) received: {message:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
@@ -1050,6 +1234,7 @@ impl PromptState {
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                self.diagnostics.note_event("agent_reasoning");
                 info!("Agent reasoning (non-delta) received: {text:?}");
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
@@ -1057,6 +1242,7 @@ impl PromptState {
                 }
             }
             EventMsg::ThreadNameUpdated(event) => {
+                self.diagnostics.note_event("thread_name_updated");
                 info!("Thread name updated: {:?}", event.thread_name);
                 if let Some(title) = event.thread_name {
                     client
@@ -1067,11 +1253,13 @@ impl PromptState {
                 }
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
+                self.diagnostics.note_plan_update(&plan);
                 // Send this to the client via session/update notification
                 info!("Agent plan updated. Explanation: {:?}", explanation);
                 client.update_plan(plan).await;
             }
             EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
+                self.diagnostics.note_event("web_search_begin");
                 info!("Web search started: call_id={}", call_id);
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id).await;
@@ -1081,6 +1269,7 @@ impl PromptState {
                 query,
                 action,
             }) => {
+                self.diagnostics.note_event("web_search_query");
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
                 // (WebSearchEnd just means we have the query, not that results are ready)
@@ -1090,6 +1279,7 @@ impl PromptState {
                 // We mark as completed when a new tool call begins
             }
             EventMsg::ExecApprovalRequest(event) => {
+                self.diagnostics.note_event("exec_approval_request");
                 info!(
                     "Command execution started: call_id={}, command={:?}",
                     event.call_id, event.command
@@ -1101,6 +1291,7 @@ impl PromptState {
                 }
             }
             EventMsg::ExecCommandBegin(event) => {
+                self.diagnostics.note_event("exec_command_begin");
                 info!(
                     "Command execution started: call_id={}, command={:?}",
                     event.call_id, event.command
@@ -1108,9 +1299,11 @@ impl PromptState {
                 self.exec_command_begin(client, event).await;
             }
             EventMsg::ExecCommandOutputDelta(delta_event) => {
+                self.diagnostics.note_event("exec_command_output_delta");
                 self.exec_command_output_delta(client, delta_event).await;
             }
             EventMsg::ExecCommandEnd(end_event) => {
+                self.diagnostics.note_event("exec_command_end");
                 info!(
                     "Command execution ended: call_id={}, exit_code={}",
                     end_event.call_id, end_event.exit_code
@@ -1118,6 +1311,7 @@ impl PromptState {
                 self.exec_command_end(client, end_event).await;
             }
             EventMsg::TerminalInteraction(event) => {
+                self.diagnostics.note_event("terminal_interaction");
                 info!(
                     "Terminal interaction: call_id={}, process_id={}, stdin={}",
                     event.call_id, event.process_id, event.stdin
@@ -1125,10 +1319,12 @@ impl PromptState {
                 self.terminal_interaction(client, event).await;
             }
             EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments }) => {
+                self.diagnostics.note_event("dynamic_tool_call_begin");
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments).await;
             }
             EventMsg::DynamicToolCallResponse(event) => {
+                self.diagnostics.note_event("dynamic_tool_call_end");
                 info!(
                     "Dynamic tool call response: call_id={}, turn_id={}, tool={}",
                     event.call_id, event.turn_id, event.tool
@@ -1139,6 +1335,7 @@ impl PromptState {
                 call_id,
                 invocation,
             }) => {
+                self.diagnostics.note_event("mcp_tool_call_begin");
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
                     invocation.server, invocation.tool
@@ -1151,6 +1348,7 @@ impl PromptState {
                 duration,
                 result,
             }) => {
+                self.diagnostics.note_event("mcp_tool_call_end");
                 info!(
                     "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
                     invocation.server, invocation.tool
@@ -1158,6 +1356,7 @@ impl PromptState {
                 self.end_mcp_tool_call(client, call_id, result).await;
             }
             EventMsg::ApplyPatchApprovalRequest(event) => {
+                self.diagnostics.note_event("patch_approval_request");
                 info!(
                     "Apply patch approval request: call_id={}, reason={:?}",
                     event.call_id, event.reason
@@ -1169,6 +1368,7 @@ impl PromptState {
                 }
             }
             EventMsg::PatchApplyBegin(event) => {
+                self.diagnostics.note_event("patch_apply_begin");
                 info!(
                     "Patch apply begin: call_id={}, auto_approved={}",
                     event.call_id, event.auto_approved
@@ -1176,6 +1376,7 @@ impl PromptState {
                 self.start_patch_apply(client, event).await;
             }
             EventMsg::PatchApplyEnd(event) => {
+                self.diagnostics.note_event("patch_apply_end");
                 info!(
                     "Patch apply end: call_id={}, success={}",
                     event.call_id, event.success
@@ -1187,16 +1388,47 @@ impl PromptState {
                 turn_id,
                 item,
             }) => {
+                self.diagnostics.note_event("item_completed");
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                if let TurnItem::AgentMessage(agent_message) = item {
+                    if let Some(message_id) = self
+                        .agent_message_ids_by_item_id
+                        .remove(agent_message.id.as_str())
+                    {
+                        client
+                            .send_agent_message_completed(message_id, agent_message.id)
+                            .await;
+                    }
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
+                self.diagnostics.note_turn_complete(&turn_id);
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                info!(
+                    submission_id = %self.submission_id,
+                    turn_id = turn_id,
+                    event_count = self.event_count,
+                    last_event_kind = ?self.diagnostics.last_event_kind,
+                    last_agent_preview = self.diagnostics.last_agent_preview.as_deref().unwrap_or(""),
+                    pending_permission_count = self.pending_permission_interactions.len(),
+                    active_command_count = self.active_commands.len(),
+                    active_web_search = self.active_web_search.is_some(),
+                    active_guardian_assessment_count = self.active_guardian_assessments.len(),
+                    "codex_acp.prompt.turn_complete_seen"
+                );
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::EndTurn)).ok();
+                    let sent = response_tx.send(Ok(StopReason::EndTurn)).is_ok();
+                    self.diagnostics.note_response_sent();
+                    info!(
+                        submission_id = %self.submission_id,
+                        turn_id = turn_id,
+                        sent = sent,
+                        "codex_acp.prompt.response_sent"
+                    );
                 }
             }
             EventMsg::UndoStarted(event) => {
@@ -1221,6 +1453,7 @@ impl PromptState {
                 codex_error_info,
                 additional_details,
             }) => {
+                self.diagnostics.note_stream_error();
                 error!(
                     "Handled error during turn: {message} {codex_error_info:?} {additional_details:?}"
                 );
@@ -1229,31 +1462,56 @@ impl PromptState {
                 message,
                 codex_error_info,
             }) => {
+                self.diagnostics.note_event("error");
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx
+                    let sent = response_tx
                         .send(Err(Error::internal_error().data(
                             json!({ "message": message, "codex_error_info": codex_error_info }),
                         )))
-                        .ok();
+                        .is_ok();
+                    self.diagnostics.note_response_sent();
+                    info!(
+                        submission_id = %self.submission_id,
+                        turn_id = ?self.diagnostics.current_turn_id,
+                        sent = sent,
+                        "codex_acp.prompt.error_response_sent"
+                    );
                 }
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+                self.diagnostics.note_event("turn_aborted");
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                    let sent = response_tx.send(Ok(StopReason::Cancelled)).is_ok();
+                    self.diagnostics.note_response_sent();
+                    info!(
+                        submission_id = %self.submission_id,
+                        turn_id = ?turn_id,
+                        sent = sent,
+                        "codex_acp.prompt.cancel_response_sent"
+                    );
                 }
             }
             EventMsg::ShutdownComplete => {
+                self.diagnostics.note_event("shutdown_complete");
                 info!("Agent shutting down");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
-                    response_tx.send(Ok(StopReason::Cancelled)).ok();
+                    let sent = response_tx.send(Ok(StopReason::Cancelled)).is_ok();
+                    self.diagnostics.note_response_sent();
+                    info!(
+                        submission_id = %self.submission_id,
+                        turn_id = ?self.diagnostics.current_turn_id,
+                        sent = sent,
+                        "codex_acp.prompt.shutdown_response_sent"
+                    );
                 }
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
+                self.diagnostics.note_event("view_image_tool_call");
                 info!("ViewImageToolCallEvent received");
                 let display_path = path.display().to_string();
                 client
@@ -1268,9 +1526,11 @@ impl PromptState {
                     .await;
             }
             EventMsg::EnteredReviewMode(review_request) => {
+                self.diagnostics.note_event("review_mode_entered");
                 info!("Review begin: request={review_request:?}");
             }
             EventMsg::ExitedReviewMode(event) => {
+                self.diagnostics.note_event("review_mode_exited");
                 info!("Review end: output={event:?}");
                 if let Err(err) = self.review_mode_exit(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
@@ -1279,12 +1539,14 @@ impl PromptState {
                 }
             }
             EventMsg::Warning(WarningEvent { message }) => {
+                self.diagnostics.note_event("warning");
                 warn!("Warning: {message}");
                 // Forward warnings to the client as agent messages so users see
                 // informational notices (e.g., the post-compact advisory message).
                 client.send_agent_text(message).await;
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
+                self.diagnostics.note_event("mcp_startup_update");
                 info!("MCP startup update: server={server}, status={status:?}");
             }
             EventMsg::McpStartupComplete(McpStartupCompleteEvent {
@@ -1292,11 +1554,13 @@ impl PromptState {
                 failed,
                 cancelled,
             }) => {
+                self.diagnostics.note_event("mcp_startup_complete");
                 info!(
                     "MCP startup complete: ready={ready:?}, failed={failed:?}, cancelled={cancelled:?}"
                 );
             }
             EventMsg::ElicitationRequest(event) => {
+                self.diagnostics.note_event("elicitation_request");
                 info!("Elicitation request: server={}, id={:?}", event.server_name, event.id);
                 if let Err(err) = self.mcp_elicitation(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
@@ -1305,14 +1569,17 @@ impl PromptState {
                 }
             }
             EventMsg::ModelReroute(ModelRerouteEvent { from_model, to_model, reason }) => {
+                self.diagnostics.note_event("model_reroute");
                 info!("Model reroute: from={from_model}, to={to_model}, reason={reason:?}");
             }
 
             EventMsg::ContextCompacted(..) => {
+                self.diagnostics.note_event("context_compacted");
                 info!("Context compacted");
                 client.send_agent_text("Context compacted\n".to_string()).await;
             }
             EventMsg::RequestPermissions(event) => {
+                self.diagnostics.note_event("request_permissions");
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
                 if let Err(err) = self.request_permissions(client, event).await
                     && let Some(response_tx) = self.response_tx.take()
@@ -2475,6 +2742,36 @@ impl SessionClient {
         .await;
     }
 
+    async fn send_agent_text_with_message_id(
+        &self,
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(text.into().into()).message_id(message_id.into()),
+        ))
+        .await;
+    }
+
+    async fn send_agent_message_completed(
+        &self,
+        message_id: impl Into<String>,
+        codex_item_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new("".to_string().into())
+                .message_id(message_id.into())
+                .meta(Meta::from_iter([(
+                    ANYHARNESS_META_KEY.to_string(),
+                    json!({
+                        "transcriptEvent": ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT,
+                        "codexItemId": codex_item_id.into(),
+                    }),
+                )])),
+        ))
+        .await;
+    }
+
     async fn send_agent_thought(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             text.into().into(),
@@ -2611,6 +2908,9 @@ impl<A: Auth> ThreadActor<A> {
 
     async fn spawn(mut self) {
         let mut message_rx_open = true;
+        let mut prompt_watchdog = tokio::time::interval(Duration::from_secs(15));
+        prompt_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        prompt_watchdog.tick().await;
         loop {
             tokio::select! {
                 biased;
@@ -2621,6 +2921,11 @@ impl<A: Auth> ThreadActor<A> {
                 message = self.resolution_rx.recv() => if let Some(message) = message {
                     self.handle_message(message).await
                 },
+                _ = prompt_watchdog.tick() => {
+                    for submission in self.submissions.values() {
+                        submission.log_pending_diagnostics();
+                    }
+                }
                 event = self.thread.next_event() => match event {
                     Ok(event) => self.handle_event(event).await,
                     Err(e) => {
@@ -4098,6 +4403,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streamed_agent_message_completion_marker_reuses_message_id() -> anyhow::Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state =
+                    PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+                for delta in ["Hel", "lo"] {
+                    prompt_state
+                        .handle_event(
+                            &session_client,
+                            EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                                thread_id: "thread-id".to_string(),
+                                turn_id: "turn-id".to_string(),
+                                item_id: "item-1".to_string(),
+                                delta: delta.to_string(),
+                            }),
+                        )
+                        .await;
+                }
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::ItemCompleted(ItemCompletedEvent {
+                            thread_id: codex_protocol::ThreadId::new(),
+                            turn_id: "turn-id".to_string(),
+                            item: TurnItem::AgentMessage(codex_protocol::items::AgentMessageItem {
+                                id: "item-1".to_string(),
+                                content: vec![],
+                                phase: None,
+                                memory_citation: None,
+                            }),
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 3);
+
+                let first_parts = agent_message_chunk_parts(&notifications[0].update);
+                assert_eq!(first_parts.0, "Hel");
+                assert!(first_parts.2.is_none());
+                let first_message_id = first_parts.1.to_string();
+                Uuid::parse_str(&first_message_id)?;
+
+                let second_parts = agent_message_chunk_parts(&notifications[1].update);
+                assert_eq!(second_parts.0, "lo");
+                assert_eq!(second_parts.1, first_message_id);
+                assert!(second_parts.2.is_none());
+
+                let completion_parts = agent_message_chunk_parts(&notifications[2].update);
+                assert_eq!(completion_parts.0, "");
+                assert_eq!(completion_parts.1, first_message_id);
+                assert_eq!(
+                    serde_json::to_value(completion_parts.2.expect("completion meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "assistant_message_completed",
+                            "codexItemId": "item-1",
+                        },
+                    })
+                );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
     async fn test_compact() -> anyhow::Result<()> {
         let (session_id, client, thread, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4987,6 +5369,19 @@ mod tests {
             self.notifications.lock().unwrap().push(args);
             Ok(())
         }
+    }
+
+    fn agent_message_chunk_parts(update: &SessionUpdate) -> (&str, &str, Option<&Meta>) {
+        let SessionUpdate::AgentMessageChunk(ContentChunk {
+            content: ContentBlock::Text(TextContent { text, .. }),
+            message_id: Some(message_id),
+            meta,
+            ..
+        }) = update
+        else {
+            panic!("expected agent message chunk with message id, got {update:?}");
+        };
+        (text, message_id, meta.as_ref())
     }
 
     #[tokio::test]
