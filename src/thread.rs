@@ -50,8 +50,9 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
+        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, HookCompletedEvent,
+        HookRunStatus, HookRunSummary, HookStartedEvent, ItemCompletedEvent, ItemStartedEvent,
+        ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
         McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
         NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
         PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
@@ -89,6 +90,7 @@ static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_a
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const ANYHARNESS_META_KEY: &str = "anyharness";
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
+const ANYHARNESS_TRANSIENT_STATUS_EVENT: &str = "transient_status";
 const CODEX_REQUEST_USER_INPUT_EXT_METHOD: &str = "experimental/codex/requestUserInput";
 const CODEX_MCP_ELICITATION_EXT_METHOD: &str = "experimental/codex/mcpElicitation";
 
@@ -1094,6 +1096,7 @@ struct PromptState {
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
     agent_message_ids_by_item_id: HashMap<String, String>,
+    transient_status_message_id: Option<String>,
     diagnostics: PromptDiagnostics,
 }
 
@@ -1117,6 +1120,7 @@ impl PromptState {
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
             agent_message_ids_by_item_id: HashMap::new(),
+            transient_status_message_id: None,
             diagnostics: PromptDiagnostics::new(),
         }
     }
@@ -1132,6 +1136,12 @@ impl PromptState {
         self.agent_message_ids_by_item_id
             .entry(item_id.to_string())
             .or_insert_with(|| Uuid::new_v4().to_string())
+            .clone()
+    }
+
+    fn transient_status_message_id(&mut self) -> String {
+        self.transient_status_message_id
+            .get_or_insert_with(|| Uuid::new_v4().to_string())
             .clone()
     }
 
@@ -1353,6 +1363,7 @@ impl PromptState {
                 collaboration_mode_kind,
                 turn_id,
             }) => {
+                self.transient_status_message_id = None;
                 self.diagnostics.note_turn_started(&turn_id);
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -1600,6 +1611,7 @@ impl PromptState {
                 }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
+                self.transient_status_message_id = None;
                 self.diagnostics.note_turn_complete(&turn_id);
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
@@ -1679,6 +1691,7 @@ impl PromptState {
                 }
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+                self.transient_status_message_id = None;
                 self.diagnostics.note_event("turn_aborted");
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
@@ -1800,18 +1813,36 @@ impl PromptState {
                 );
                 self.guardian_assessment(client, event).await;
             }
+            EventMsg::BackgroundEvent(event) => {
+                self.diagnostics.note_event("background_event");
+                let message_id = self.transient_status_message_id();
+                client.send_transient_status(event.message, message_id).await;
+            }
+            EventMsg::HookStarted(event) => {
+                self.diagnostics.note_event("hook_started");
+                self.hook_started(client, event).await;
+            }
+            EventMsg::HookCompleted(event) => {
+                self.diagnostics.note_event("hook_completed");
+                self.hook_completed(client, event).await;
+            }
+            EventMsg::DeprecationNotice(event) => {
+                self.diagnostics.note_event("deprecation_notice");
+                let mut message = format!("Warning: {}", event.summary.trim());
+                if let Some(details) = event.details.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                    message.push_str("\n\n");
+                    message.push_str(details);
+                }
+                client.send_agent_text(message).await;
+            }
 
             // Ignore these events
             EventMsg::ImageGenerationBegin(..)
             | EventMsg::ImageGenerationEnd(..)
             | EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
-            | EventMsg::HookStarted(..)
-            | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
             | EventMsg::SkillsUpdateAvailable
             // Old events
             | EventMsg::AgentMessageDelta(..)
@@ -1840,10 +1871,47 @@ impl PromptState {
             | EventMsg::ListSkillsResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::DeprecationNotice(..)) => {
+            ) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    async fn hook_started(&self, client: &SessionClient, event: HookStartedEvent) {
+        let call_id = hook_tool_call_id(&event.run.id);
+        let content = hook_tool_content(&event.run);
+        let mut tool_call = ToolCall::new(call_id, hook_title(&event.run))
+            .kind(ToolKind::Other)
+            .status(ToolCallStatus::InProgress)
+            .meta(hook_meta(&event.run));
+        if !content.is_empty() {
+            tool_call = tool_call.content(content);
+        }
+        client.send_tool_call(tool_call).await;
+    }
+
+    async fn hook_completed(&self, client: &SessionClient, event: HookCompletedEvent) {
+        let status = match event.run.status {
+            HookRunStatus::Completed => ToolCallStatus::Completed,
+            HookRunStatus::Running => ToolCallStatus::InProgress,
+            HookRunStatus::Blocked | HookRunStatus::Failed | HookRunStatus::Stopped => {
+                ToolCallStatus::Failed
+            }
+        };
+        let content = hook_tool_content(&event.run);
+        let mut fields = ToolCallUpdateFields::new()
+            .title(hook_title(&event.run))
+            .kind(ToolKind::Other)
+            .status(status);
+        if !content.is_empty() {
+            fields = fields.content(content);
+        }
+        client
+            .send_tool_call_update(
+                ToolCallUpdate::new(hook_tool_call_id(&event.run.id), fields)
+                    .meta(hook_meta(&event.run)),
+            )
+            .await;
     }
 
     async fn request_user_input(
@@ -3223,6 +3291,20 @@ impl SessionClient {
                     json!({
                         "transcriptEvent": ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT,
                         "codexItemId": codex_item_id.into(),
+                    }),
+                )])),
+        ))
+        .await;
+    }
+
+    async fn send_transient_status(&self, text: impl Into<String>, message_id: impl Into<String>) {
+        self.send_notification(SessionUpdate::AgentThoughtChunk(
+            ContentChunk::new(text.into().into())
+                .message_id(message_id.into())
+                .meta(Meta::from_iter([(
+                    ANYHARNESS_META_KEY.to_string(),
+                    json!({
+                        "transcriptEvent": ANYHARNESS_TRANSIENT_STATUS_EVENT,
                     }),
                 )])),
         ))
@@ -5091,6 +5173,53 @@ fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
 }
 
+fn hook_tool_call_id(hook_id: &str) -> String {
+    format!("codex-hook-{hook_id}")
+}
+
+fn hook_title(run: &HookRunSummary) -> String {
+    format!("Hook: {}", format!("{:?}", run.event_name).to_title_case())
+}
+
+fn hook_meta(run: &HookRunSummary) -> Meta {
+    Meta::from_iter([(
+        ANYHARNESS_META_KEY.to_string(),
+        json!({
+            "nativeToolName": "CodexHook",
+            "toolKind": "hook",
+            "hookId": run.id,
+            "hookStatus": format!("{:?}", run.status),
+        }),
+    )])
+}
+
+fn hook_tool_content(run: &HookRunSummary) -> Vec<ToolCallContent> {
+    let mut lines = Vec::new();
+    if let Some(message) = run
+        .status_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        lines.push(message.to_string());
+    }
+    for entry in &run.entries {
+        let text = entry.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "{}: {text}",
+            format!("{:?}", entry.kind).to_title_case()
+        ));
+    }
+    if lines.is_empty() {
+        Vec::new()
+    } else {
+        vec![ToolCallContent::Content(Content::new(lines.join("\n")))]
+    }
+}
+
 fn initial_collaboration_mask(
     models_manager: &dyn ModelsManagerImpl,
 ) -> Option<CollaborationModeMask> {
@@ -5145,6 +5274,11 @@ mod tests {
         test_support::{all_model_presets, builtin_collaboration_mode_presets},
     };
     use codex_protocol::config_types::ModeKind;
+    use codex_protocol::protocol::{
+        BackgroundEventEvent, DeprecationNoticeEvent, HookEventName, HookExecutionMode,
+        HookHandlerType, HookOutputEntry, HookOutputEntryKind, HookScope, PlanDeltaEvent,
+        RawResponseItemEvent,
+    };
     use tokio::{
         sync::{Mutex, Notify, mpsc::UnboundedSender},
         task::LocalSet,
@@ -5192,6 +5326,46 @@ mod tests {
                     description: "Use the recommended provider".to_string(),
                 }]),
             }],
+        }
+    }
+
+    fn prompt_state_with_stub_client(
+        client: Arc<StubClient>,
+    ) -> (SessionClient, PromptState, Arc<StubCodexThread>) {
+        let session_client =
+            SessionClient::with_client(SessionId::new("test"), client, Arc::default());
+        let thread = Arc::new(StubCodexThread::new());
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let prompt_state = PromptState::new(
+            "submission-id".to_string(),
+            thread.clone(),
+            message_tx,
+            response_tx,
+        );
+        (session_client, prompt_state, thread)
+    }
+
+    fn hook_run_summary(
+        id: &str,
+        status: HookRunStatus,
+        status_message: Option<&str>,
+        entries: Vec<HookOutputEntry>,
+    ) -> HookRunSummary {
+        HookRunSummary {
+            id: id.to_string(),
+            event_name: HookEventName::PreToolUse,
+            handler_type: HookHandlerType::Command,
+            execution_mode: HookExecutionMode::Sync,
+            scope: HookScope::Turn,
+            source_path: PathBuf::from("/tmp/hook.json"),
+            display_order: 0,
+            status,
+            status_message: status_message.map(str::to_string),
+            started_at: 1,
+            completed_at: None,
+            duration_ms: None,
+            entries,
         }
     }
 
@@ -5302,6 +5476,255 @@ mod tests {
                         },
                     })
                 );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_status_background_event_emits_transient_thought() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let client = Arc::new(StubClient::new());
+                let (session_client, mut prompt_state, _thread) =
+                    prompt_state_with_stub_client(client.clone());
+
+                for message in ["Working in the background", "Still checking hooks"] {
+                    prompt_state
+                        .handle_event(
+                            &session_client,
+                            EventMsg::BackgroundEvent(BackgroundEventEvent {
+                                message: message.to_string(),
+                            }),
+                        )
+                        .await;
+                }
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 2);
+
+                let first = agent_thought_chunk_parts(&notifications[0].update);
+                assert_eq!(first.0, "Working in the background");
+                Uuid::parse_str(first.1)?;
+                assert_eq!(
+                    serde_json::to_value(first.2.expect("transient meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "transient_status",
+                        },
+                    })
+                );
+
+                let second = agent_thought_chunk_parts(&notifications[1].update);
+                assert_eq!(second.0, "Still checking hooks");
+                assert_eq!(second.1, first.1);
+                assert_eq!(
+                    serde_json::to_value(second.2.expect("transient meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "transient_status",
+                        },
+                    })
+                );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_status_hook_started_emits_visible_hook_tool_call() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let client = Arc::new(StubClient::new());
+                let (session_client, mut prompt_state, _thread) =
+                    prompt_state_with_stub_client(client.clone());
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::HookStarted(HookStartedEvent {
+                            turn_id: Some("turn-1".to_string()),
+                            run: hook_run_summary(
+                                "hook-1",
+                                HookRunStatus::Running,
+                                Some("Checking command policy"),
+                                Vec::new(),
+                            ),
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1);
+                let SessionUpdate::ToolCall(tool_call) = &notifications[0].update else {
+                    panic!("expected hook tool call, got {:?}", notifications[0].update);
+                };
+                assert_eq!(tool_call.tool_call_id.0.as_ref(), "codex-hook-hook-1");
+                assert_eq!(tool_call.title, "Hook: Pre Tool Use");
+                assert_eq!(tool_call.kind, ToolKind::Other);
+                assert_eq!(tool_call.status, ToolCallStatus::InProgress);
+                assert_eq!(
+                    tool_call_content_text(&tool_call.content),
+                    "Checking command policy"
+                );
+                assert_eq!(
+                    serde_json::to_value(tool_call.meta.as_ref().expect("hook meta"))?,
+                    json!({
+                        "anyharness": {
+                            "nativeToolName": "CodexHook",
+                            "toolKind": "hook",
+                            "hookId": "hook-1",
+                            "hookStatus": "Running",
+                        },
+                    })
+                );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_status_hook_completed_emits_terminal_hook_update() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let client = Arc::new(StubClient::new());
+                let (session_client, mut prompt_state, _thread) =
+                    prompt_state_with_stub_client(client.clone());
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::HookCompleted(HookCompletedEvent {
+                            turn_id: Some("turn-1".to_string()),
+                            run: hook_run_summary(
+                                "hook-1",
+                                HookRunStatus::Blocked,
+                                Some("Hook blocked the action"),
+                                vec![HookOutputEntry {
+                                    kind: HookOutputEntryKind::Error,
+                                    text: "Missing approval".to_string(),
+                                }],
+                            ),
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1);
+                let SessionUpdate::ToolCallUpdate(update) = &notifications[0].update else {
+                    panic!(
+                        "expected hook tool call update, got {:?}",
+                        notifications[0].update
+                    );
+                };
+                assert_eq!(update.tool_call_id.0.as_ref(), "codex-hook-hook-1");
+                assert_eq!(update.fields.title.as_deref(), Some("Hook: Pre Tool Use"));
+                assert_eq!(update.fields.kind, Some(ToolKind::Other));
+                assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
+                let content = update
+                    .fields
+                    .content
+                    .as_deref()
+                    .expect("hook update content");
+                assert_eq!(
+                    tool_call_content_text(content),
+                    "Hook blocked the action\nError: Missing approval"
+                );
+                assert_eq!(
+                    serde_json::to_value(update.meta.as_ref().expect("hook meta"))?,
+                    json!({
+                        "anyharness": {
+                            "nativeToolName": "CodexHook",
+                            "toolKind": "hook",
+                            "hookId": "hook-1",
+                            "hookStatus": "Blocked",
+                        },
+                    })
+                );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_status_deprecation_notice_emits_warning_prose() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let client = Arc::new(StubClient::new());
+                let (session_client, mut prompt_state, _thread) =
+                    prompt_state_with_stub_client(client.clone());
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::DeprecationNotice(DeprecationNoticeEvent {
+                            summary: "Legacy configuration is deprecated".to_string(),
+                            details: Some("Use the new config key instead.".to_string()),
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1);
+                let SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) = &notifications[0].update
+                else {
+                    panic!(
+                        "expected deprecation warning prose, got {:?}",
+                        notifications[0].update
+                    );
+                };
+                assert!(text.contains("Warning: Legacy configuration is deprecated"));
+                assert!(text.contains("Use the new config key instead."));
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_status_plan_delta_and_raw_response_item_remain_non_visible() -> anyhow::Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                let client = Arc::new(StubClient::new());
+                let (session_client, mut prompt_state, _thread) =
+                    prompt_state_with_stub_client(client.clone());
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::PlanDelta(PlanDeltaEvent {
+                            thread_id: "thread-1".to_string(),
+                            turn_id: "turn-1".to_string(),
+                            item_id: "plan-1".to_string(),
+                            delta: "- hidden draft step\n".to_string(),
+                        }),
+                    )
+                    .await;
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::RawResponseItem(RawResponseItemEvent {
+                            item: ResponseItem::CustomToolCall {
+                                id: None,
+                                status: None,
+                                call_id: "call-1".to_string(),
+                                name: "raw-tool".to_string(),
+                                input: "{}".to_string(),
+                            },
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert!(notifications.is_empty());
 
                 anyhow::Ok(())
             })
@@ -6466,6 +6889,33 @@ mod tests {
             panic!("expected agent message chunk with message id, got {update:?}");
         };
         (text, message_id, meta.as_ref())
+    }
+
+    fn agent_thought_chunk_parts(update: &SessionUpdate) -> (&str, &str, Option<&Meta>) {
+        let SessionUpdate::AgentThoughtChunk(ContentChunk {
+            content: ContentBlock::Text(TextContent { text, .. }),
+            message_id: Some(message_id),
+            meta,
+            ..
+        }) = update
+        else {
+            panic!("expected agent thought chunk with message id, got {update:?}");
+        };
+        (text, message_id, meta.as_ref())
+    }
+
+    fn tool_call_content_text(content: &[ToolCallContent]) -> String {
+        content
+            .iter()
+            .filter_map(|content| match content {
+                ToolCallContent::Content(Content {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[tokio::test]
