@@ -475,6 +475,14 @@ impl ResolvedMcpElicitation {
         }
     }
 
+    fn decline() -> Self {
+        Self {
+            action: ElicitationAction::Decline,
+            content: None,
+            meta: None,
+        }
+    }
+
     fn cancel() -> Self {
         Self {
             action: ElicitationAction::Cancel,
@@ -519,6 +527,9 @@ const MCP_TOOL_APPROVAL_ALLOW_OPTION_ID: &str = "approved";
 const MCP_TOOL_APPROVAL_ALLOW_SESSION_OPTION_ID: &str = "approved-for-session";
 const MCP_TOOL_APPROVAL_ALLOW_ALWAYS_OPTION_ID: &str = "approved-always";
 const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
+const MCP_ELICITATION_ACCEPT_OPTION_ID: &str = "accept";
+const MCP_ELICITATION_DECLINE_OPTION_ID: &str = "decline";
+const MCP_ELICITATION_CANCEL_OPTION_ID: &str = "cancel";
 
 struct SupportedMcpElicitationPermissionRequest {
     request_key: String,
@@ -534,22 +545,66 @@ fn build_supported_mcp_elicitation_permission_request(
     raw_input: serde_json::Value,
 ) -> Option<SupportedMcpElicitationPermissionRequest> {
     let ElicitationRequest::Form {
-        meta: Some(meta),
+        meta,
         message,
-        requested_schema: _,
+        requested_schema,
     } = request
     else {
         return None;
     };
-    let meta = meta.as_object()?;
-    if meta
-        .get(MCP_TOOL_APPROVAL_KIND_KEY)
-        .and_then(serde_json::Value::as_str)
-        != Some(MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL)
-    {
+
+    if !is_message_only_elicitation_schema(requested_schema) {
         return None;
     }
 
+    let meta = meta
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let approval_kind = meta
+        .get(MCP_TOOL_APPROVAL_KIND_KEY)
+        .and_then(serde_json::Value::as_str);
+    if approval_kind.is_some() && approval_kind != Some(MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL) {
+        return None;
+    }
+
+    let (tool_call_id, title, content, options, option_map) =
+        if approval_kind == Some(MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL) {
+            build_mcp_tool_approval_permission(server_name, request_id, message, &meta)
+        } else {
+            build_message_only_mcp_permission(request_id, message)
+        };
+
+    Some(SupportedMcpElicitationPermissionRequest {
+        request_key: mcp_elicitation_request_key(server_name, request_id),
+        tool_call: ToolCallUpdate::new(
+            ToolCallId::new(tool_call_id),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Pending)
+                .title(title)
+                .content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(content)),
+                ))])
+                .raw_input(raw_input),
+        ),
+        options,
+        option_map,
+    })
+}
+
+fn build_mcp_tool_approval_permission(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+    message: &str,
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> (
+    String,
+    String,
+    String,
+    Vec<PermissionOption>,
+    HashMap<String, ResolvedMcpElicitation>,
+) {
     let (allow_session_remember, allow_persistent_approval) = mcp_tool_approval_persist_modes(meta);
     let mut options = vec![PermissionOption::new(
         MCP_TOOL_APPROVAL_ALLOW_OPTION_ID,
@@ -605,21 +660,69 @@ fn build_supported_mcp_elicitation_permission_request(
         .unwrap_or_else(|| "Approve MCP tool call".to_string());
     let content = format_mcp_tool_approval_content(server_name, message, meta);
 
-    Some(SupportedMcpElicitationPermissionRequest {
-        request_key: mcp_elicitation_request_key(server_name, request_id),
-        tool_call: ToolCallUpdate::new(
-            ToolCallId::new(tool_call_id),
-            ToolCallUpdateFields::new()
-                .status(ToolCallStatus::Pending)
-                .title(title)
-                .content(vec![ToolCallContent::Content(Content::new(
-                    ContentBlock::Text(TextContent::new(content)),
-                ))])
-                .raw_input(raw_input),
+    (tool_call_id, title, content, options, option_map)
+}
+
+fn build_message_only_mcp_permission(
+    request_id: &codex_protocol::mcp::RequestId,
+    message: &str,
+) -> (
+    String,
+    String,
+    String,
+    Vec<PermissionOption>,
+    HashMap<String, ResolvedMcpElicitation>,
+) {
+    let options = vec![
+        PermissionOption::new(
+            MCP_ELICITATION_ACCEPT_OPTION_ID,
+            "Allow",
+            PermissionOptionKind::AllowOnce,
         ),
+        PermissionOption::new(
+            MCP_ELICITATION_DECLINE_OPTION_ID,
+            "Deny",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            MCP_ELICITATION_CANCEL_OPTION_ID,
+            "Cancel",
+            PermissionOptionKind::RejectOnce,
+        ),
+    ];
+    let option_map = HashMap::from([
+        (
+            MCP_ELICITATION_ACCEPT_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::accept(),
+        ),
+        (
+            MCP_ELICITATION_DECLINE_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::decline(),
+        ),
+        (
+            MCP_ELICITATION_CANCEL_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::cancel(),
+        ),
+    ]);
+
+    (
+        format!("mcp-elicitation:{request_id}"),
+        "Approve MCP request".to_string(),
+        message.trim().to_string(),
         options,
         option_map,
-    })
+    )
+}
+
+fn is_message_only_elicitation_schema(schema: &serde_json::Value) -> bool {
+    schema.is_null()
+        || schema.as_object().is_some_and(|schema| {
+            schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
+                && schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+        })
 }
 
 fn mcp_tool_approval_persist_modes(
@@ -741,6 +844,13 @@ impl SubmissionState {
         match self {
             Self::CustomPrompts(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
+        }
+    }
+
+    fn current_turn_id(&self) -> Option<&str> {
+        match self {
+            Self::CustomPrompts(..) => None,
+            Self::Prompt(state) => state.diagnostics.current_turn_id.as_deref(),
         }
     }
 
@@ -1479,15 +1589,14 @@ impl PromptState {
             }) => {
                 self.diagnostics.note_event("item_completed");
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
-                if let TurnItem::AgentMessage(agent_message) = item {
-                    if let Some(message_id) = self
+                if let TurnItem::AgentMessage(agent_message) = item
+                    && let Some(message_id) = self
                         .agent_message_ids_by_item_id
                         .remove(agent_message.id.as_str())
-                    {
-                        client
-                            .send_agent_message_completed(message_id, agent_message.id)
-                            .await;
-                    }
+                {
+                    client
+                        .send_agent_message_completed(message_id, agent_message.id)
+                        .await;
                 }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
@@ -4585,8 +4694,60 @@ impl<A: Auth> ThreadActor<A> {
 
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
+        } else if let EventMsg::ElicitationRequest(event) = &msg {
+            let Some(submission_id) = self.submission_id_for_unscoped_elicitation(event) else {
+                warn!(
+                    "Received MCP elicitation event with no routable active submission: {id} {msg:?}"
+                );
+                return;
+            };
+
+            let Some(submission) = self.submissions.get_mut(&submission_id) else {
+                warn!("Resolved MCP elicitation route to missing submission ID: {submission_id}");
+                return;
+            };
+
+            info!(
+                "Routing MCP elicitation event with id {id} to active submission {submission_id}"
+            );
+            submission.handle_event(&self.client, msg).await;
         } else {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
+        }
+    }
+
+    fn submission_id_for_unscoped_elicitation(
+        &self,
+        event: &ElicitationRequestEvent,
+    ) -> Option<String> {
+        if let Some(turn_id) = &event.turn_id {
+            if self.submissions.contains_key(turn_id) {
+                return Some(turn_id.clone());
+            }
+
+            let mut matches = self
+                .submissions
+                .iter()
+                .filter(|(_, submission)| submission.current_turn_id() == Some(turn_id.as_str()))
+                .map(|(submission_id, _)| submission_id.clone());
+            let first = matches.next()?;
+            if matches.next().is_none() {
+                return Some(first);
+            }
+
+            return None;
+        }
+
+        let mut active = self
+            .submissions
+            .iter()
+            .filter(|(_, submission)| submission.is_active())
+            .map(|(submission_id, _)| submission_id.clone());
+        let first = active.next()?;
+        if active.next().is_none() {
+            Some(first)
+        } else {
+            None
         }
     }
 
@@ -6662,6 +6823,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_elicitation_routes_message_only_form_through_permission() -> anyhow::Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_permission_responses(vec![
+                    RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(MCP_ELICITATION_DECLINE_OPTION_ID),
+                    )),
+                ]));
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                            request: ElicitationRequest::Form {
+                                meta: None,
+                                message: "Approve the message-only action".to_string(),
+                                requested_schema: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {},
+                                    "additionalProperties": false,
+                                }),
+                            },
+                        },
+                    )
+                    .await?;
+
+                let ThreadMessage::PermissionRequestResolved {
+                    submission_id,
+                    request_key,
+                    response,
+                } = message_rx.recv().await.unwrap()
+                else {
+                    panic!("expected permission resolution message");
+                };
+                assert_eq!(submission_id, "submission-id");
+
+                {
+                    let requests = client.permission_requests.lock().unwrap();
+                    let request = requests.last().unwrap();
+                    assert_eq!(
+                        request.tool_call.fields.title.as_deref(),
+                        Some("Approve MCP request")
+                    );
+                    assert_eq!(
+                        request
+                            .options
+                            .iter()
+                            .map(|option| option.option_id.0.to_string())
+                            .collect::<Vec<_>>(),
+                        vec![
+                            MCP_ELICITATION_ACCEPT_OPTION_ID.to_string(),
+                            MCP_ELICITATION_DECLINE_OPTION_ID.to_string(),
+                            MCP_ELICITATION_CANCEL_OPTION_ID.to_string(),
+                        ]
+                    );
+                }
+
+                prompt_state
+                    .handle_permission_request_resolved(&session_client, request_key, response)
+                    .await?;
+
+                let op = thread.ops.lock().unwrap().last().cloned().unwrap();
+                assert!(matches!(
+                    op,
+                    Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_protocol::mcp::RequestId::String(request_id),
+                        decision: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    } if server_name == "test-server" && request_id == "request-id"
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_mcp_elicitation_uses_ext_method_when_supported() -> anyhow::Result<()> {
         LocalSet::new()
             .run_until(async {
@@ -6722,6 +6980,96 @@ mod tests {
                     assert_eq!(params["request"]["mode"], "form");
                     assert_eq!(params["request"]["message"], "Need some structured input");
                 }
+
+                let ops = thread.ops.lock().unwrap();
+                assert_eq!(ops.len(), 1);
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_protocol::mcp::RequestId::String(request_id),
+                        decision: ElicitationAction::Accept,
+                        content: Some(content),
+                        meta: None,
+                    }) if server_name == "test-server"
+                        && request_id == "request-id"
+                        && content["name"] == "docs"
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unscoped_mcp_elicitation_routes_to_single_active_submission() -> anyhow::Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_ext_responses(vec![ext_response(json!({
+                    "outcome": "accepted",
+                    "content": {
+                        "name": "docs"
+                    }
+                }))]));
+                let session_client = SessionClient::with_client(
+                    session_id,
+                    client.clone(),
+                    mcp_elicitation_capabilities(),
+                );
+                let thread = Arc::new(StubCodexThread::new());
+                let models_manager = Arc::new(StubModelsManager);
+                let config = Config::load_with_cli_overrides_and_harness_overrides(
+                    vec![],
+                    ConfigOverrides::default(),
+                )
+                .await?;
+                let (_message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut actor = ThreadActor::new(
+                    StubAuth,
+                    session_client,
+                    thread.clone(),
+                    models_manager,
+                    config,
+                    message_rx,
+                    resolution_tx.clone(),
+                    resolution_rx,
+                );
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                actor.submissions.insert(
+                    "submission-id".to_string(),
+                    SubmissionState::Prompt(PromptState::new(
+                        "submission-id".to_string(),
+                        thread.clone(),
+                        resolution_tx,
+                        response_tx,
+                    )),
+                );
+
+                actor
+                    .handle_event(Event {
+                        id: "mcp_elicitation_request".to_string(),
+                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
+                            turn_id: None,
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                            request: ElicitationRequest::Form {
+                                meta: None,
+                                message: "Need some structured input".to_string(),
+                                requested_schema: json!({
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" }
+                                    }
+                                }),
+                            },
+                        }),
+                    })
+                    .await;
 
                 let ops = thread.ops.lock().unwrap();
                 assert_eq!(ops.len(), 1);
