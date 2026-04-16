@@ -75,7 +75,7 @@ use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, value::RawValue};
+use serde_json::{Value, json, value::RawValue};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -90,6 +90,7 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const ANYHARNESS_META_KEY: &str = "anyharness";
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
 const CODEX_REQUEST_USER_INPUT_EXT_METHOD: &str = "experimental/codex/requestUserInput";
+const CODEX_MCP_ELICITATION_EXT_METHOD: &str = "experimental/codex/mcpElicitation";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +140,31 @@ struct CodexRequestUserInputExtAnswer {
     question_id: String,
     selected_option_label: Option<String>,
     text: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexMcpElicitationExtParams {
+    server_name: String,
+    request: ElicitationRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexMcpElicitationExtResponse {
+    outcome: CodexMcpElicitationExtOutcome,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<Value>,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CodexMcpElicitationExtOutcome {
+    Accepted,
+    Declined,
+    Cancelled,
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -1894,6 +1920,41 @@ impl PromptState {
             ElicitationRequest::Url { .. } => "url",
         };
 
+        if client.supports_mcp_elicitation() {
+            let response = match client
+                .mcp_elicitation(CodexMcpElicitationExtParams {
+                    server_name: server_name.clone(),
+                    request: request.clone(),
+                })
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(
+                        "mcp_elicitation extension failed before response delivery; declining: {err:?}"
+                    );
+                    CodexMcpElicitationExtResponse {
+                        outcome: CodexMcpElicitationExtOutcome::Declined,
+                        content: None,
+                        meta: None,
+                    }
+                }
+            };
+            let (decision, content, meta) = Self::codex_mcp_elicitation_response(response);
+            self.thread
+                .submit(Op::ResolveElicitation {
+                    server_name,
+                    request_id: id,
+                    decision,
+                    content,
+                    meta,
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+            return Ok(());
+        }
+
         info!(
             "Auto-declining unsupported MCP elicitation: server={}, id={:?}, kind={request_kind}",
             server_name, id
@@ -1911,6 +1972,18 @@ impl PromptState {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         Ok(())
+    }
+
+    fn codex_mcp_elicitation_response(
+        response: CodexMcpElicitationExtResponse,
+    ) -> (ElicitationAction, Option<Value>, Option<Value>) {
+        match response.outcome {
+            CodexMcpElicitationExtOutcome::Accepted => {
+                (ElicitationAction::Accept, response.content, response.meta)
+            }
+            CodexMcpElicitationExtOutcome::Declined => (ElicitationAction::Decline, None, None),
+            CodexMcpElicitationExtOutcome::Cancelled => (ElicitationAction::Cancel, None, None),
+        }
     }
 
     async fn review_mode_exit(
@@ -2931,6 +3004,14 @@ impl SessionClient {
     }
 
     fn supports_request_user_input(&self) -> bool {
+        self.supports_codex_capability("requestUserInput")
+    }
+
+    fn supports_mcp_elicitation(&self) -> bool {
+        self.supports_codex_capability("mcpElicitation")
+    }
+
+    fn supports_codex_capability(&self, capability: &str) -> bool {
         self.client_capabilities
             .lock()
             .unwrap()
@@ -2939,7 +3020,7 @@ impl SessionClient {
             .is_some_and(|v| {
                 v.get("codex").is_some_and(|codex| {
                     codex
-                        .get("requestUserInput")
+                        .get(capability)
                         .is_some_and(|enabled| enabled.as_bool().unwrap_or_default())
                 })
             })
@@ -2962,6 +3043,26 @@ impl SessionClient {
             .await?;
 
         serde_json::from_str::<CodexRequestUserInputExtResponse>(response.0.get())
+            .map_err(|e| Error::invalid_params().data(e.to_string()))
+    }
+
+    async fn mcp_elicitation(
+        &self,
+        params: CodexMcpElicitationExtParams,
+    ) -> Result<CodexMcpElicitationExtResponse, Error> {
+        let params = serde_json::to_string(&params)
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let params = RawValue::from_string(params)
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let response = self
+            .client
+            .ext_method(ExtRequest::new(
+                CODEX_MCP_ELICITATION_EXT_METHOD,
+                params.into(),
+            ))
+            .await?;
+
+        serde_json::from_str::<CodexMcpElicitationExtResponse>(response.0.get())
             .map_err(|e| Error::invalid_params().data(e.to_string()))
     }
 
@@ -4891,14 +4992,22 @@ mod tests {
     use super::*;
 
     fn request_user_input_capabilities() -> Arc<std::sync::Mutex<ClientCapabilities>> {
-        Arc::new(std::sync::Mutex::new(ClientCapabilities::new().meta(
-            Meta::from_iter([(
-                "codex".to_string(),
-                json!({
-                    "requestUserInput": true,
-                }),
-            )]),
-        )))
+        codex_capabilities(json!({
+            "requestUserInput": true,
+        }))
+    }
+
+    fn mcp_elicitation_capabilities() -> Arc<std::sync::Mutex<ClientCapabilities>> {
+        codex_capabilities(json!({
+            "requestUserInput": true,
+            "mcpElicitation": true,
+        }))
+    }
+
+    fn codex_capabilities(codex: serde_json::Value) -> Arc<std::sync::Mutex<ClientCapabilities>> {
+        Arc::new(std::sync::Mutex::new(
+            ClientCapabilities::new().meta(Meta::from_iter([("codex".to_string(), codex)])),
+        ))
     }
 
     fn ext_response(value: serde_json::Value) -> agent_client_protocol::ExtResponse {
@@ -6543,6 +6652,200 @@ mod tests {
                         content: None,
                         meta: None,
                     }) if server_name == "test-server" && request_id == "request-id"
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_elicitation_uses_ext_method_when_supported() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_ext_responses(vec![ext_response(json!({
+                    "outcome": "accepted",
+                    "content": {
+                        "name": "docs"
+                    }
+                }))]));
+                let session_client = SessionClient::with_client(
+                    session_id,
+                    client.clone(),
+                    mcp_elicitation_capabilities(),
+                );
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                            request: ElicitationRequest::Form {
+                                meta: Some(json!({ "debug": "live-only" })),
+                                message: "Need some structured input".to_string(),
+                                requested_schema: json!({
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" }
+                                    }
+                                }),
+                            },
+                        },
+                    )
+                    .await?;
+
+                {
+                    let ext_requests = client.ext_requests.lock().unwrap();
+                    assert_eq!(ext_requests.len(), 1);
+                    assert_eq!(
+                        ext_requests[0].method.as_ref(),
+                        CODEX_MCP_ELICITATION_EXT_METHOD
+                    );
+                    let params: serde_json::Value =
+                        serde_json::from_str(ext_requests[0].params.get())?;
+                    assert_eq!(params["serverName"], "test-server");
+                    assert!(params.get("id").is_none());
+                    assert_eq!(params["request"]["mode"], "form");
+                    assert_eq!(params["request"]["message"], "Need some structured input");
+                }
+
+                let ops = thread.ops.lock().unwrap();
+                assert_eq!(ops.len(), 1);
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_protocol::mcp::RequestId::String(request_id),
+                        decision: ElicitationAction::Accept,
+                        content: Some(content),
+                        meta: None,
+                    }) if server_name == "test-server"
+                        && request_id == "request-id"
+                        && content["name"] == "docs"
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_elicitation_invalid_ext_response_declines() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_ext_responses(vec![ext_response(json!(
+                    null
+                ))]));
+                let session_client =
+                    SessionClient::with_client(session_id, client, mcp_elicitation_capabilities());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                            request: ElicitationRequest::Url {
+                                meta: None,
+                                message: "Authorize access".to_string(),
+                                url: "https://example.com/authorize".to_string(),
+                                elicitation_id: "elicitation-id".to_string(),
+                            },
+                        },
+                    )
+                    .await?;
+
+                let ops = thread.ops.lock().unwrap();
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::ResolveElicitation {
+                        decision: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                        ..
+                    })
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_elicitation_cancel_response_cancels() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_ext_responses(vec![ext_response(json!({
+                    "outcome": "cancelled"
+                }))]));
+                let session_client =
+                    SessionClient::with_client(session_id, client, mcp_elicitation_capabilities());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                            request: ElicitationRequest::Url {
+                                meta: None,
+                                message: "Authorize access".to_string(),
+                                url: "https://example.com/authorize".to_string(),
+                                elicitation_id: "elicitation-id".to_string(),
+                            },
+                        },
+                    )
+                    .await?;
+
+                let ops = thread.ops.lock().unwrap();
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::ResolveElicitation {
+                        decision: ElicitationAction::Cancel,
+                        content: None,
+                        meta: None,
+                        ..
+                    })
                 ));
 
                 anyhow::Ok(())
