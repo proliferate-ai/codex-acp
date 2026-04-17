@@ -89,6 +89,8 @@ static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_a
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const ANYHARNESS_META_KEY: &str = "anyharness";
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
+const ANYHARNESS_PROPOSED_PLAN_DELTA_EVENT: &str = "proposed_plan_delta";
+const ANYHARNESS_PROPOSED_PLAN_COMPLETED_EVENT: &str = "proposed_plan_completed";
 const CODEX_REQUEST_USER_INPUT_EXT_METHOD: &str = "experimental/codex/requestUserInput";
 
 #[derive(Serialize)]
@@ -1258,6 +1260,17 @@ impl PromptState {
                 let message_id = self.agent_message_id_for_item(&item_id);
                 client.send_agent_text_with_message_id(delta, message_id).await;
             }
+            EventMsg::PlanDelta(event) => {
+                self.diagnostics.note_agent_output("plan_delta", &event.delta);
+                info!(
+                    "Plan delta received: thread_id: {}, turn_id: {}, item_id: {}, delta: {:?}",
+                    event.thread_id, event.turn_id, event.item_id, event.delta
+                );
+                let message_id = self.agent_message_id_for_item(&event.item_id);
+                client
+                    .send_proposed_plan_delta(event.delta, message_id, event.item_id)
+                    .await;
+            }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
                 turn_id,
@@ -1453,15 +1466,25 @@ impl PromptState {
             }) => {
                 self.diagnostics.note_event("item_completed");
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
-                if let TurnItem::AgentMessage(agent_message) = item {
-                    if let Some(message_id) = self
-                        .agent_message_ids_by_item_id
-                        .remove(agent_message.id.as_str())
-                    {
+                match item {
+                    TurnItem::AgentMessage(agent_message) => {
+                        if let Some(message_id) = self
+                            .agent_message_ids_by_item_id
+                            .remove(agent_message.id.as_str())
+                        {
+                            client
+                                .send_agent_message_completed(message_id, agent_message.id)
+                                .await;
+                        }
+                    }
+                    TurnItem::Plan(plan_item) => {
+                        self.agent_message_ids_by_item_id
+                            .remove(plan_item.id.as_str());
                         client
-                            .send_agent_message_completed(message_id, agent_message.id)
+                            .send_proposed_plan_completed(plan_item.text, plan_item.id)
                             .await;
                     }
+                    _ => {}
                 }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
@@ -1697,8 +1720,7 @@ impl PromptState {
             | EventMsg::CollabResumeBegin(..)
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
-            | EventMsg::PlanDelta(..)=> {}
+            | EventMsg::CollabCloseEnd(..)=> {}
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
@@ -3013,6 +3035,47 @@ impl SessionClient {
                     json!({
                         "transcriptEvent": ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT,
                         "codexItemId": codex_item_id.into(),
+                    }),
+                )])),
+        ))
+        .await;
+    }
+
+    async fn send_proposed_plan_delta(
+        &self,
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+        codex_item_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(text.into().into())
+                .message_id(message_id.into())
+                .meta(Meta::from_iter([(
+                    ANYHARNESS_META_KEY.to_string(),
+                    json!({
+                        "transcriptEvent": ANYHARNESS_PROPOSED_PLAN_DELTA_EVENT,
+                        "codexItemId": codex_item_id.into(),
+                    }),
+                )])),
+        ))
+        .await;
+    }
+
+    async fn send_proposed_plan_completed(
+        &self,
+        text: impl Into<String>,
+        codex_item_id: impl Into<String>,
+    ) {
+        let codex_item_id = codex_item_id.into();
+        self.send_notification(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(text.into().into())
+                .message_id(Uuid::new_v4().to_string())
+                .meta(Meta::from_iter([(
+                    ANYHARNESS_META_KEY.to_string(),
+                    json!({
+                        "transcriptEvent": ANYHARNESS_PROPOSED_PLAN_COMPLETED_EVENT,
+                        "codexItemId": codex_item_id.clone(),
+                        "sourceItemId": codex_item_id,
                     }),
                 )])),
         ))
@@ -5029,6 +5092,148 @@ mod tests {
                         "anyharness": {
                             "transcriptEvent": "assistant_message_completed",
                             "codexItemId": "item-1",
+                        },
+                    })
+                );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_plan_delta_streams_as_proposed_plan_delta() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state =
+                    PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+                for delta in ["- Step 1\n", "- Step 2\n"] {
+                    prompt_state
+                        .handle_event(
+                            &session_client,
+                            EventMsg::PlanDelta(codex_protocol::protocol::PlanDeltaEvent {
+                                thread_id: "thread-id".to_string(),
+                                turn_id: "turn-id".to_string(),
+                                item_id: "plan-1".to_string(),
+                                delta: delta.to_string(),
+                            }),
+                        )
+                        .await;
+                }
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::ItemCompleted(ItemCompletedEvent {
+                            thread_id: codex_protocol::ThreadId::new(),
+                            turn_id: "turn-id".to_string(),
+                            item: TurnItem::Plan(codex_protocol::items::PlanItem {
+                                id: "plan-1".to_string(),
+                                text: "- Step 1\n- Step 2\n".to_string(),
+                            }),
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 3);
+
+                let first_parts = agent_message_chunk_parts(&notifications[0].update);
+                assert_eq!(first_parts.0, "- Step 1\n");
+                let first_message_id = first_parts.1.to_string();
+                Uuid::parse_str(&first_message_id)?;
+                assert_eq!(
+                    serde_json::to_value(first_parts.2.expect("plan delta meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "proposed_plan_delta",
+                            "codexItemId": "plan-1",
+                        },
+                    })
+                );
+
+                let second_parts = agent_message_chunk_parts(&notifications[1].update);
+                assert_eq!(second_parts.0, "- Step 2\n");
+                assert_eq!(second_parts.1, first_message_id);
+                assert_eq!(
+                    serde_json::to_value(second_parts.2.expect("plan delta meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "proposed_plan_delta",
+                            "codexItemId": "plan-1",
+                        },
+                    })
+                );
+
+                let completion_parts = agent_message_chunk_parts(&notifications[2].update);
+                assert_eq!(completion_parts.0, "- Step 1\n- Step 2\n");
+                Uuid::parse_str(completion_parts.1)?;
+                assert_ne!(completion_parts.1, first_message_id);
+                assert_eq!(
+                    serde_json::to_value(completion_parts.2.expect("completion meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "proposed_plan_completed",
+                            "codexItemId": "plan-1",
+                            "sourceItemId": "plan-1",
+                        },
+                    })
+                );
+
+                anyhow::Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_completed_plan_item_emits_proposed_plan_completed() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state =
+                    PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+
+                prompt_state
+                    .handle_event(
+                        &session_client,
+                        EventMsg::ItemCompleted(ItemCompletedEvent {
+                            thread_id: codex_protocol::ThreadId::new(),
+                            turn_id: "turn-id".to_string(),
+                            item: TurnItem::Plan(codex_protocol::items::PlanItem {
+                                id: "plan-1".to_string(),
+                                text: "1. Investigate\n2. Fix\n".to_string(),
+                            }),
+                        }),
+                    )
+                    .await;
+
+                let notifications = client.notifications.lock().unwrap();
+                assert_eq!(notifications.len(), 1);
+
+                let completion_parts = agent_message_chunk_parts(&notifications[0].update);
+                assert_eq!(completion_parts.0, "1. Investigate\n2. Fix\n");
+                Uuid::parse_str(completion_parts.1)?;
+                assert_eq!(
+                    serde_json::to_value(completion_parts.2.expect("completion meta"))?,
+                    json!({
+                        "anyharness": {
+                            "transcriptEvent": "proposed_plan_completed",
+                            "codexItemId": "plan-1",
+                            "sourceItemId": "plan-1",
                         },
                     })
                 );
