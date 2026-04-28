@@ -453,7 +453,7 @@ enum PendingPermissionRequest {
     },
     RequestPermissions {
         call_id: String,
-        permissions: RequestPermissionProfile,
+        option_map: HashMap<String, RequestPermissionsResponse>,
     },
     McpElicitation {
         server_name: String,
@@ -546,6 +546,10 @@ const MCP_TOOL_APPROVAL_CANCEL_OPTION_ID: &str = "cancel";
 const MCP_ELICITATION_ACCEPT_OPTION_ID: &str = "accept";
 const MCP_ELICITATION_DECLINE_OPTION_ID: &str = "decline";
 const MCP_ELICITATION_CANCEL_OPTION_ID: &str = "cancel";
+const REQUEST_PERMISSIONS_ALLOW_SESSION_OPTION_ID: &str = "approved-for-session";
+const REQUEST_PERMISSIONS_ALLOW_TURN_OPTION_ID: &str = "approved";
+const REQUEST_PERMISSIONS_ALLOW_TURN_STRICT_OPTION_ID: &str = "approved-with-strict-auto-review";
+const REQUEST_PERMISSIONS_DENY_OPTION_ID: &str = "abort";
 
 struct SupportedMcpElicitationPermissionRequest {
     request_key: String,
@@ -731,13 +735,90 @@ fn build_message_only_mcp_permission(
 }
 
 fn is_message_only_elicitation_schema(schema: &serde_json::Value) -> bool {
-    schema.as_object().is_some_and(|schema| {
-        schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
-            && schema
-                .get("properties")
-                .and_then(serde_json::Value::as_object)
-                .is_some_and(serde_json::Map::is_empty)
-    })
+    let Some(schema) = schema.as_object() else {
+        return false;
+    };
+
+    if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return false;
+    }
+    if !schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        return false;
+    }
+    if schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+        return false;
+    }
+    if schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|required| !required.is_empty())
+    {
+        return false;
+    }
+
+    [
+        "allOf",
+        "anyOf",
+        "dependentRequired",
+        "dependentSchemas",
+        "else",
+        "if",
+        "not",
+        "oneOf",
+        "patternProperties",
+        "propertyNames",
+        "then",
+        "unevaluatedProperties",
+    ]
+    .iter()
+    .all(|key| !schema.contains_key(*key))
+}
+
+fn denied_request_permissions_response() -> RequestPermissionsResponse {
+    RequestPermissionsResponse {
+        permissions: RequestPermissionProfile::default(),
+        scope: PermissionGrantScope::Turn,
+        strict_auto_review: false,
+    }
+}
+
+fn request_permissions_option_map(
+    permissions: &RequestPermissionProfile,
+) -> HashMap<String, RequestPermissionsResponse> {
+    HashMap::from([
+        (
+            REQUEST_PERMISSIONS_ALLOW_SESSION_OPTION_ID.to_string(),
+            RequestPermissionsResponse {
+                permissions: permissions.clone(),
+                scope: PermissionGrantScope::Session,
+                strict_auto_review: false,
+            },
+        ),
+        (
+            REQUEST_PERMISSIONS_ALLOW_TURN_OPTION_ID.to_string(),
+            RequestPermissionsResponse {
+                permissions: permissions.clone(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            },
+        ),
+        (
+            REQUEST_PERMISSIONS_ALLOW_TURN_STRICT_OPTION_ID.to_string(),
+            RequestPermissionsResponse {
+                permissions: permissions.clone(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: true,
+            },
+        ),
+        (
+            REQUEST_PERMISSIONS_DENY_OPTION_ID.to_string(),
+            denied_request_permissions_response(),
+        ),
+    ])
 }
 
 fn mcp_tool_approval_persist_modes(
@@ -1233,34 +1314,19 @@ impl PromptState {
             }
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions,
+                option_map,
             } => {
                 let response = match response.outcome {
                     RequestPermissionOutcome::Selected(SelectedPermissionOutcome {
                         option_id,
                         ..
-                    }) => match option_id.0.as_ref() {
-                        "approved-for-session" => RequestPermissionsResponse {
-                            permissions: permissions.clone(),
-                            scope: PermissionGrantScope::Session,
-                            strict_auto_review: false,
-                        },
-                        "approved" => RequestPermissionsResponse {
-                            permissions: permissions.clone(),
-                            scope: PermissionGrantScope::Turn,
-                            strict_auto_review: false,
-                        },
-                        _ => RequestPermissionsResponse {
-                            permissions: RequestPermissionProfile::default(),
-                            scope: PermissionGrantScope::Turn,
-                            strict_auto_review: false,
-                        },
-                    },
-                    RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
-                        permissions: RequestPermissionProfile::default(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    },
+                    }) => option_map
+                        .get(option_id.0.as_ref())
+                        .cloned()
+                        .unwrap_or_else(denied_request_permissions_response),
+                    RequestPermissionOutcome::Cancelled | _ => {
+                        denied_request_permissions_response()
+                    }
                 };
 
                 self.thread
@@ -2879,12 +2945,15 @@ impl PromptState {
             Some(vec![content.join("\n").into()])
         };
 
+        let permissions: RequestPermissionProfile = permissions.into();
+        let option_map = request_permissions_option_map(&permissions);
+
         self.spawn_permission_request(
             client,
             permissions_request_key(&call_id),
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions: permissions.into(),
+                option_map,
             },
             ToolCallUpdate::new(
                 tool_call_id,
@@ -2896,12 +2965,25 @@ impl PromptState {
             ),
             vec![
                 PermissionOption::new(
-                    "approved-for-session",
+                    REQUEST_PERMISSIONS_ALLOW_SESSION_OPTION_ID,
                     "Yes, for session",
                     PermissionOptionKind::AllowAlways,
                 ),
-                PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
-                PermissionOption::new("abort", "No", PermissionOptionKind::RejectOnce),
+                PermissionOption::new(
+                    REQUEST_PERMISSIONS_ALLOW_TURN_OPTION_ID,
+                    "Yes",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    REQUEST_PERMISSIONS_ALLOW_TURN_STRICT_OPTION_ID,
+                    "Yes, with strict review for this turn",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    REQUEST_PERMISSIONS_DENY_OPTION_ID,
+                    "No",
+                    PermissionOptionKind::RejectOnce,
+                ),
             ],
         );
 
@@ -5407,6 +5489,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_message_only_elicitation_schema_requires_sealed_empty_object() {
+        assert!(is_message_only_elicitation_schema(&json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })));
+
+        for schema in [
+            json!({
+                "type": "object",
+                "properties": {},
+            }),
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+                "required": ["name"],
+            }),
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+                "patternProperties": {
+                    "^x-": { "type": "string" },
+                },
+            }),
+        ] {
+            assert!(!is_message_only_elicitation_schema(&schema));
+        }
+    }
+
     fn request_user_input_event() -> RequestUserInputEvent {
         RequestUserInputEvent {
             call_id: "call-1".to_string(),
@@ -7400,6 +7514,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_permissions_strict_auto_review_option() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::with_permission_responses(vec![
+                    RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(
+                            REQUEST_PERMISSIONS_ALLOW_TURN_STRICT_OPTION_ID,
+                        ),
+                    )),
+                ]));
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .request_permissions(
+                        &session_client,
+                        RequestPermissionsEvent {
+                            call_id: "permissions-call-id".to_string(),
+                            turn_id: "turn-id".to_string(),
+                            reason: Some("Need network access".to_string()),
+                            permissions: RequestPermissionProfile {
+                                network: Some(codex_protocol::models::NetworkPermissions {
+                                    enabled: Some(true),
+                                }),
+                                file_system: None,
+                            },
+                            cwd: None,
+                        },
+                    )
+                    .await?;
+
+                let ThreadMessage::PermissionRequestResolved {
+                    submission_id,
+                    request_key,
+                    response,
+                } = message_rx.recv().await.unwrap()
+                else {
+                    panic!("expected permission resolution message");
+                };
+                assert_eq!(submission_id, "submission-id");
+
+                {
+                    let requests = client.permission_requests.lock().unwrap();
+                    let request = requests.last().unwrap();
+                    assert_eq!(
+                        request
+                            .options
+                            .iter()
+                            .map(|option| option.option_id.0.to_string())
+                            .collect::<Vec<_>>(),
+                        vec![
+                            REQUEST_PERMISSIONS_ALLOW_SESSION_OPTION_ID.to_string(),
+                            REQUEST_PERMISSIONS_ALLOW_TURN_OPTION_ID.to_string(),
+                            REQUEST_PERMISSIONS_ALLOW_TURN_STRICT_OPTION_ID.to_string(),
+                            REQUEST_PERMISSIONS_DENY_OPTION_ID.to_string(),
+                        ]
+                    );
+                }
+
+                prompt_state
+                    .handle_permission_request_resolved(&session_client, request_key, response)
+                    .await?;
+
+                let ops = thread.ops.lock().unwrap();
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::RequestPermissionsResponse { id, response })
+                        if id == "permissions-call-id"
+                            && response.scope == PermissionGrantScope::Turn
+                            && response.strict_auto_review
+                            && response.permissions.network.as_ref().and_then(|network| network.enabled) == Some(true)
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_mcp_tool_approval_elicitation_routes_to_permission_request() -> anyhow::Result<()>
     {
         LocalSet::new()
@@ -7448,7 +7653,8 @@ mod tests {
                                 message: "Allow Docs to run tool \"search_docs\"?".to_string(),
                                 requested_schema: serde_json::json!({
                                     "type": "object",
-                                    "properties": {}
+                                    "properties": {},
+                                    "additionalProperties": false,
                                 }),
                             },
                         },
@@ -7624,6 +7830,68 @@ mod tests {
                 assert!(
                     requests.is_empty(),
                     "null MCP elicitation schema should not be treated as message-only"
+                );
+
+                let ops = thread.ops.lock().unwrap();
+                assert!(matches!(
+                    ops.last(),
+                    Some(Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_protocol::mcp::RequestId::String(request_id),
+                        decision: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    }) if server_name == "test-server" && request_id == "request-id"
+                ));
+
+                anyhow::Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mcp_elicitation_declines_unsealed_empty_object_schema() -> anyhow::Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let session_id = SessionId::new("test");
+                let client = Arc::new(StubClient::new());
+                let session_client =
+                    SessionClient::with_client(session_id, client.clone(), Arc::default());
+                let thread = Arc::new(StubCodexThread::new());
+                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+                let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    thread.clone(),
+                    message_tx,
+                    response_tx,
+                );
+
+                prompt_state
+                    .mcp_elicitation(
+                        &session_client,
+                        ElicitationRequestEvent {
+                            turn_id: Some("turn-id".to_string()),
+                            server_name: "test-server".to_string(),
+                            id: codex_protocol::mcp::RequestId::String("request-id".to_string()),
+                            request: ElicitationRequest::Form {
+                                meta: None,
+                                message: "Need maybe-empty input".to_string(),
+                                requested_schema: serde_json::json!({
+                                    "type": "object",
+                                    "properties": {},
+                                }),
+                            },
+                        },
+                    )
+                    .await?;
+
+                let requests = client.permission_requests.lock().unwrap();
+                assert!(
+                    requests.is_empty(),
+                    "open object schemas should not be treated as message-only"
                 );
 
                 let ops = thread.ops.lock().unwrap();
