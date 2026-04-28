@@ -927,7 +927,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-#[expect(clippy::large_enum_variant)]
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
@@ -2945,7 +2944,7 @@ impl PromptState {
             Some(vec![content.join("\n").into()])
         };
 
-        let permissions: RequestPermissionProfile = permissions.into();
+        let permissions: RequestPermissionProfile = permissions;
         let option_map = request_permissions_option_map(&permissions);
 
         self.spawn_permission_request(
