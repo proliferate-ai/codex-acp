@@ -12,7 +12,6 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod prompt_args;
 mod thread;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
@@ -45,7 +44,7 @@ pub async fn run_main(
     })?;
 
     let config_overrides = ConfigOverrides {
-        codex_linux_sandbox_exe,
+        codex_linux_sandbox_exe: codex_linux_sandbox_exe.clone(),
         ..ConfigOverrides::default()
     };
 
@@ -60,7 +59,10 @@ pub async fn run_main(
             })?;
 
     // Create our Agent implementation with notification channel
-    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+    let agent = Rc::new(codex_agent::CodexAgent::new(
+        config,
+        codex_linux_sandbox_exe,
+    )?);
 
     let stdin = tokio::io::stdin().compat();
     let stdout = tokio::io::stdout().compat_write();
