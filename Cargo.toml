@@ -27,6 +27,7 @@ codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
+codex-features = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-mcp-server = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
@@ -36,7 +37,10 @@ codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = 
 codex-utils-absolute-path = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.125.0" }
 diffy = "0.4.2"
+# Pin avoids pulling winnow 1.0 through gix 0.81/codex-git-utils while public
+# gix APIs still expose winnow 0.x types.
 gix-actor = "=0.40.0"
+# Pin avoids icu 2.2 API changes breaking temporal_rs through v8/codex-code-mode.
 icu_calendar = "~2.1"
 itertools = "0.14.0"
 regex-lite = "0.1"

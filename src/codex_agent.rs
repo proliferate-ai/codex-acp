@@ -16,6 +16,7 @@ use codex_core::{
     find_thread_path_by_id_str, parse_cursor,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
+use codex_features::Feature;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
     auth::{AuthManager, CodexAuth, read_codex_api_key_from_env, read_openai_api_key_from_env},
@@ -76,11 +77,26 @@ impl CodexAgent {
             auth_manager.clone(),
             SessionSource::Unknown,
             CollaborationModesConfig {
-                // False for now
-                default_mode_request_user_input: false,
+                default_mode_request_user_input: config
+                    .features
+                    .enabled(Feature::DefaultModeRequestUserInput),
             },
             Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::from_env(
-                ExecServerRuntimePaths::new(std::env::current_exe()?, codex_linux_sandbox_exe)?,
+                ExecServerRuntimePaths::new(
+                    std::env::current_exe().map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("resolving codex-acp executable path: {e}"),
+                        )
+                    })?,
+                    codex_linux_sandbox_exe,
+                )
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("building Codex exec-server runtime paths: {e}"),
+                    )
+                })?,
             ))),
             None,
         );

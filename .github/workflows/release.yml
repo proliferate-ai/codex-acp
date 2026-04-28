@@ -353,7 +353,8 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event.inputs.publish_profile == 'all' }}
+    # Publishing is intentionally dispatch-only; tag/push triggers should not infer this input.
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile == 'all' }}
     environment: release # Optional: for enhanced security
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -399,7 +400,8 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event.inputs.publish_profile == 'all' }}
+    # Publishing is intentionally dispatch-only; tag/push triggers should not infer this input.
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile == 'all' }}
     environment: release # Optional: for enhanced security
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -444,7 +446,8 @@ jobs:
     name: Create Release
     needs: [get-version, build, publish-npm-base]
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.publish_profile == 'all' }}
+    # Release creation tracks the full publish path, not linux-only smoke dispatches.
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile == 'all' }}
 
     steps:
       - uses: actions/checkout@v4
