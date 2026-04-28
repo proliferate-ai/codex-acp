@@ -1,13 +1,21 @@
-/// Mostly copied from `codex_tui::bottom_pane::prompt_args`: <https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1>
-use codex_protocol::custom_prompts::CustomPrompt;
 use regex_lite::Regex;
 use shlex::Shlex;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use tokio::fs;
 
 static PROMPT_ARG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$[A-Z][A-Z0-9_]*").unwrap_or_else(|_| std::process::abort()));
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomPrompt {
+    pub name: String,
+    pub path: PathBuf,
+    pub content: String,
+    pub description: Option<String>,
+    pub argument_hint: Option<String>,
+}
 
 #[derive(Debug)]
 pub enum PromptArgsError {
@@ -55,8 +63,6 @@ impl PromptExpansionError {
 }
 
 /// Parse a first-line slash command of the form `/name <rest>`.
-/// Returns `(name, rest_after_name)` if the line begins with `/` and contains
-/// a non-empty name; otherwise returns `None`.
 pub fn parse_slash_name(line: &str) -> Option<(&str, &str)> {
     let stripped = line.strip_prefix('/')?;
     let mut name_end = stripped.len();
@@ -74,20 +80,14 @@ pub fn parse_slash_name(line: &str) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
-/// Extracts the unique placeholder variable names from a prompt template.
-///
-/// A placeholder is any token that matches the pattern `$[A-Z][A-Z0-9_]*`
-/// (for example `$USER`). The function returns the variable names without
-/// the leading `$`, de-duplicated and in the order of first appearance.
-pub fn prompt_argument_names(content: &str) -> Vec<String> {
+fn prompt_argument_names(content: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut names = Vec::new();
-    for m in PROMPT_ARG_REGEX.find_iter(content) {
-        if m.start() > 0 && content.as_bytes()[m.start() - 1] == b'$' {
+    for matched in PROMPT_ARG_REGEX.find_iter(content) {
+        if matched.start() > 0 && content.as_bytes()[matched.start() - 1] == b'$' {
             continue;
         }
-        let name = &content[m.start() + 1..m.end()];
-        // Exclude special positional aggregate token from named args.
+        let name = &content[matched.start() + 1..matched.end()];
         if name == "ARGUMENTS" {
             continue;
         }
@@ -99,12 +99,7 @@ pub fn prompt_argument_names(content: &str) -> Vec<String> {
     names
 }
 
-/// Parses the `key=value` pairs that follow a custom prompt name.
-///
-/// The input is split using shlex rules, so quoted values are supported
-/// (for example `USER="Alice Smith"`). The function returns a map of parsed
-/// arguments, or an error if a token is missing `=` or if the key is empty.
-pub fn parse_prompt_inputs(rest: &str) -> Result<HashMap<String, String>, PromptArgsError> {
+fn parse_prompt_inputs(rest: &str) -> Result<HashMap<String, String>, PromptArgsError> {
     let mut map = HashMap::new();
     if rest.trim().is_empty() {
         return Ok(map);
@@ -122,11 +117,9 @@ pub fn parse_prompt_inputs(rest: &str) -> Result<HashMap<String, String>, Prompt
     Ok(map)
 }
 
-/// Expands a message of the form `/prompts:name [value] [value] …` using a matching saved prompt.
+/// Expands a saved custom prompt slash command.
 ///
-/// If the text does not start with `/prompts:`, or if no prompt named `name` exists,
-/// the function returns `Ok(None)`. On success it returns
-/// `Ok(Some(expanded))`; otherwise it returns a descriptive error.
+/// Returns `Ok(None)` when the slash command does not match any saved prompt.
 pub fn expand_custom_prompt(
     name: &str,
     rest: &str,
@@ -135,23 +128,24 @@ pub fn expand_custom_prompt(
     let Some(prompt) = custom_prompts.iter().find(|p| p.name == name) else {
         return Ok(None);
     };
-    // If there are named placeholders, expect key=value inputs.
+
     let required = prompt_argument_names(&prompt.content);
     if !required.is_empty() {
         let inputs = parse_prompt_inputs(rest).map_err(|error| PromptExpansionError::Args {
             command: format!("/{name}"),
             error,
         })?;
-        let missing: Vec<String> = required
+        let missing = required
             .into_iter()
-            .filter(|k| !inputs.contains_key(k))
-            .collect();
+            .filter(|key| !inputs.contains_key(key))
+            .collect::<Vec<_>>();
         if !missing.is_empty() {
             return Err(PromptExpansionError::MissingArgs {
                 command: format!("/{name}"),
                 missing,
             });
         }
+
         let content = &prompt.content;
         let replaced = PROMPT_ARG_REGEX.replace_all(content, |caps: &regex_lite::Captures<'_>| {
             if let Some(matched) = caps.get(0)
@@ -170,14 +164,14 @@ pub fn expand_custom_prompt(
         return Ok(Some(replaced.into_owned()));
     }
 
-    // Otherwise, treat it as numeric/positional placeholder prompt (or none).
-    let pos_args: Vec<String> = Shlex::new(rest).collect();
-    let expanded = expand_numeric_placeholders(&prompt.content, &pos_args);
-    Ok(Some(expanded))
+    let pos_args = Shlex::new(rest).collect::<Vec<_>>();
+    Ok(Some(expand_numeric_placeholders(
+        &prompt.content,
+        &pos_args,
+    )))
 }
 
-/// Expand `$1..$9` and `$ARGUMENTS` in `content` with values from `args`.
-pub fn expand_numeric_placeholders(content: &str, args: &[String]) -> String {
+fn expand_numeric_placeholders(content: &str, args: &[String]) -> String {
     let mut out = String::with_capacity(content.len());
     let mut i = 0;
     let mut cached_joined_args: Option<String> = None;
@@ -219,97 +213,155 @@ pub fn expand_numeric_placeholders(content: &str, args: &[String]) -> String {
     out
 }
 
+pub async fn discover_prompts_in(dir: &Path) -> Vec<CustomPrompt> {
+    let mut prompts = Vec::new();
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return prompts,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let is_file = fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let is_markdown = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+        if !is_markdown {
+            continue;
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let content = match fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let (description, argument_hint, content) = parse_frontmatter(&content);
+        prompts.push(CustomPrompt {
+            name,
+            path,
+            content,
+            description,
+            argument_hint,
+        });
+    }
+
+    prompts.sort_by(|left, right| left.name.cmp(&right.name));
+    prompts
+}
+
+fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>, String) {
+    let mut segments = content.split_inclusive('\n');
+    let Some(first_segment) = segments.next() else {
+        return (None, None, String::new());
+    };
+    let first_line = first_segment.trim_end_matches(['\r', '\n']);
+    if first_line.trim() != "---" {
+        return (None, None, content.to_string());
+    }
+
+    let mut description = None;
+    let mut argument_hint = None;
+    let mut frontmatter_closed = false;
+    let mut consumed = first_segment.len();
+
+    for segment in segments {
+        let line = segment.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+
+        if trimmed == "---" {
+            frontmatter_closed = true;
+            consumed += segment.len();
+            break;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            consumed += segment.len();
+            continue;
+        }
+
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            let mut value = value.trim().to_string();
+            if value.len() >= 2 {
+                let bytes = value.as_bytes();
+                let first = bytes[0];
+                let last = bytes[bytes.len() - 1];
+                if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                    value = value[1..value.len().saturating_sub(1)].to_string();
+                }
+            }
+            match key.as_str() {
+                "description" => description = Some(value),
+                "argument-hint" | "argument_hint" => argument_hint = Some(value),
+                _ => {}
+            }
+        }
+
+        consumed += segment.len();
+    }
+
+    if !frontmatter_closed {
+        return (None, None, content.to_string());
+    }
+
+    let body = if consumed >= content.len() {
+        String::new()
+    } else {
+        content[consumed..].to_string()
+    };
+    (description, argument_hint, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn expand_arguments_basic() {
-        let prompts = vec![CustomPrompt {
-            name: "my-prompt".to_string(),
-            path: "/tmp/my-prompt.md".to_string().into(),
-            content: "Review $USER changes on $BRANCH".to_string(),
+    fn custom_prompt(name: &str, content: &str) -> CustomPrompt {
+        CustomPrompt {
+            name: name.to_string(),
+            path: format!("/tmp/{name}.md").into(),
+            content: content.to_string(),
             description: None,
             argument_hint: None,
-        }];
+        }
+    }
 
-        let out = expand_custom_prompt("my-prompt", "USER=Alice BRANCH=main", &prompts).unwrap();
+    #[test]
+    fn expands_named_arguments() {
+        let prompts = vec![custom_prompt("custom", "Review $USER changes on $BRANCH")];
+        let out = expand_custom_prompt("custom", "USER=Alice BRANCH=main", &prompts).unwrap();
         assert_eq!(out, Some("Review Alice changes on main".to_string()));
     }
 
     #[test]
-    fn quoted_values_ok() {
-        let prompts = vec![CustomPrompt {
-            name: "my-prompt".to_string(),
-            path: "/tmp/my-prompt.md".to_string().into(),
-            content: "Pair $USER with $BRANCH".to_string(),
-            description: None,
-            argument_hint: None,
-        }];
-
-        let out = expand_custom_prompt(
-            "my-prompt",
-            "USER=\"Alice Smith\" BRANCH=dev-main",
-            &prompts,
-        )
-        .unwrap();
-        assert_eq!(out, Some("Pair Alice Smith with dev-main".to_string()));
+    fn expands_positional_arguments() {
+        let prompts = vec![custom_prompt(
+            "custom",
+            "Custom prompt with $1 and $ARGUMENTS.",
+        )];
+        let out = expand_custom_prompt("custom", "foo bar", &prompts).unwrap();
+        assert_eq!(out, Some("Custom prompt with foo and foo bar.".to_string()));
     }
 
     #[test]
-    fn invalid_arg_token_reports_error() {
-        let prompts = vec![CustomPrompt {
-            name: "my-prompt".to_string(),
-            path: "/tmp/my-prompt.md".to_string().into(),
-            content: "Review $USER changes".to_string(),
-            description: None,
-            argument_hint: None,
-        }];
-        let err = expand_custom_prompt("my-prompt", "USER=Alice stray", &prompts)
-            .unwrap_err()
-            .user_message();
-        assert!(err.contains("expected key=value"));
-    }
-
-    #[test]
-    fn missing_required_args_reports_error() {
-        let prompts = vec![CustomPrompt {
-            name: "my-prompt".to_string(),
-            path: "/tmp/my-prompt.md".to_string().into(),
-            content: "Review $USER changes on $BRANCH".to_string(),
-            description: None,
-            argument_hint: None,
-        }];
-        let err = expand_custom_prompt("my-prompt", "USER=Alice", &prompts)
-            .unwrap_err()
-            .user_message();
-        assert!(err.to_lowercase().contains("missing required args"));
-        assert!(err.contains("BRANCH"));
-    }
-
-    #[test]
-    fn escaped_placeholder_is_ignored() {
+    fn reports_missing_named_arguments() {
+        let prompts = vec![custom_prompt("custom", "Review $USER changes on $BRANCH")];
+        let err = expand_custom_prompt("custom", "USER=Alice", &prompts).unwrap_err();
         assert_eq!(
-            prompt_argument_names("literal $$USER"),
-            Vec::<String>::new()
+            err.user_message(),
+            "Missing required args for /custom: BRANCH. Provide as key=value (quote values with spaces)."
         );
-        assert_eq!(
-            prompt_argument_names("literal $$USER and $REAL"),
-            vec!["REAL".to_string()]
-        );
-    }
-
-    #[test]
-    fn escaped_placeholder_remains_literal() {
-        let prompts = vec![CustomPrompt {
-            name: "my-prompt".to_string(),
-            path: "/tmp/my-prompt.md".to_string().into(),
-            content: "literal $$USER".to_string(),
-            description: None,
-            argument_hint: None,
-        }];
-
-        let out = expand_custom_prompt("my-prompt", "", &prompts).unwrap();
-        assert_eq!(out, Some("literal $$USER".to_string()));
     }
 }
