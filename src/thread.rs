@@ -6,19 +6,20 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
+use serde::{Deserialize, Serialize};
 
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
-        AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ClientCapabilities,
-        ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-        EmbeddedResourceResource, ImageContent, LoadSessionResponse, Meta, PermissionOption,
-        PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest,
-        RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-        ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
-        SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        AgentRequest, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+        ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk,
+        Diff, EmbeddedResource, EmbeddedResourceResource, ExtRequest, ExtResponse, ImageContent,
+        LoadSessionResponse, MessageId, Meta, PermissionOption, PermissionOptionKind, Plan,
+        PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
+        RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
+        SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
+        SessionModeState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
         TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
         UsageUpdate,
@@ -38,6 +39,7 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
+    items::TurnItem,
     config_types::TrustLevel,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
@@ -55,17 +57,18 @@ use codex_protocol::{
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ImageGenerationBeginEvent,
-        ImageGenerationEndEvent, ItemCompletedEvent, ItemStartedEvent, McpInvocation,
-        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
-        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
-        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
-        ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
-        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
+        ApplyPatchApprovalRequestEvent, DeprecationNoticeEvent, DynamicToolCallResponseEvent,
+        ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
+        ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
+        ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
+        HookCompletedEvent, HookEventName, HookOutputEntryKind, HookRunStatus, HookRunSummary,
+        HookStartedEvent, ImageGenerationBeginEvent, ImageGenerationEndEvent, ItemCompletedEvent,
+        ItemStartedEvent, McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent,
+        McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext,
+        NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
+        PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
+        ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
         ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
@@ -74,13 +77,17 @@ use codex_protocol::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
         RequestPermissionsResponse,
     },
+    request_user_input::{
+        RequestUserInputAnswer, RequestUserInputEvent, RequestUserInputQuestion,
+        RequestUserInputQuestionOption, RequestUserInputResponse,
+    },
     user_input::UserInput,
 };
 use codex_shell_command::parse_command::parse_command;
 use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
 use heck::ToTitleCase;
 use itertools::Itertools;
-use serde_json::json;
+use serde_json::{Value, json, value::RawValue};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -93,6 +100,10 @@ trait ClientSender: Send + Sync + 'static {
         &self,
         req: RequestPermissionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>>;
+    fn ext_method(
+        &self,
+        req: ExtRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ExtResponse, Error>> + Send + '_>>;
 }
 
 /// Production implementation that wraps a `ConnectionTo<Client>`.
@@ -109,6 +120,24 @@ impl ClientSender for AcpConnection {
     ) -> Pin<Box<dyn Future<Output = Result<RequestPermissionResponse, Error>> + Send + '_>> {
         Box::pin(async move { self.0.send_request(req).block_task().await })
     }
+
+    fn ext_method(
+        &self,
+        req: ExtRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ExtResponse, Error>> + Send + '_>> {
+        Box::pin(async move {
+            // AgentRequest::ExtMethodRequest implements JsonRpcRequest<Response = serde_json::Value>.
+            // The raw JSON value is the ExtResponse payload.
+            let json_value = self
+                .0
+                .send_request(AgentRequest::ExtMethodRequest(req))
+                .block_task()
+                .await?;
+            let raw = RawValue::from_string(json_value.to_string())
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            Ok(ExtResponse::new(raw.into()))
+        })
+    }
 }
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
@@ -116,6 +145,99 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+
+// Anyharness meta keys and event names
+const ANYHARNESS_META_KEY: &str = "anyharness";
+const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
+const ANYHARNESS_TRANSIENT_STATUS_EVENT: &str = "transient_status";
+
+// Extension method names
+const CODEX_REQUEST_USER_INPUT_EXT_METHOD: &str = "experimental/codex/requestUserInput";
+const CODEX_MCP_ELICITATION_EXT_METHOD: &str = "experimental/codex/mcpElicitation";
+
+// Option IDs for message-only MCP elicitations
+const MCP_ELICITATION_ACCEPT_OPTION_ID: &str = "accept";
+const MCP_ELICITATION_DECLINE_OPTION_ID: &str = "decline";
+const MCP_ELICITATION_CANCEL_OPTION_ID: &str = "cancel";
+
+// --- requestUserInput extension types ---
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRequestUserInputExtParams {
+    call_id: String,
+    turn_id: String,
+    questions: Vec<CodexRequestUserInputExtQuestion>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRequestUserInputExtQuestion {
+    question_id: String,
+    header: String,
+    question: String,
+    is_other: bool,
+    is_secret: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    options: Vec<CodexRequestUserInputExtOption>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRequestUserInputExtOption {
+    label: String,
+    description: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRequestUserInputExtResponse {
+    outcome: CodexRequestUserInputExtOutcome,
+    #[serde(default)]
+    answers: Vec<CodexRequestUserInputExtAnswer>,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CodexRequestUserInputExtOutcome {
+    Submitted,
+    Cancelled,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRequestUserInputExtAnswer {
+    question_id: String,
+    selected_option_label: Option<String>,
+    text: Option<String>,
+}
+
+// --- mcpElicitation extension types ---
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexMcpElicitationExtParams {
+    server_name: String,
+    request: ElicitationRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexMcpElicitationExtResponse {
+    outcome: CodexMcpElicitationExtOutcome,
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(rename = "_meta", default)]
+    meta: Option<Value>,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CodexMcpElicitationExtOutcome {
+    Accepted,
+    Declined,
+    Cancelled,
+}
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
@@ -518,6 +640,14 @@ impl ResolvedMcpElicitation {
             meta: None,
         }
     }
+
+    fn decline() -> Self {
+        Self {
+            action: ElicitationAction::Decline,
+            content: None,
+            meta: None,
+        }
+    }
 }
 
 fn exec_request_key(call_id: &str) -> String {
@@ -563,6 +693,17 @@ struct SupportedMcpElicitationPermissionRequest {
     option_map: HashMap<String, ResolvedMcpElicitation>,
 }
 
+fn is_message_only_elicitation_schema(schema: &serde_json::Value) -> bool {
+    schema.is_null()
+        || schema.as_object().is_some_and(|schema| {
+            schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
+                && schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+        })
+}
+
 fn build_supported_mcp_elicitation_permission_request(
     server_name: &str,
     request_id: &codex_protocol::mcp::RequestId,
@@ -570,14 +711,40 @@ fn build_supported_mcp_elicitation_permission_request(
     raw_input: serde_json::Value,
 ) -> Option<SupportedMcpElicitationPermissionRequest> {
     let ElicitationRequest::Form {
-        meta: Some(meta),
+        meta,
         message,
-        requested_schema: _,
+        requested_schema,
     } = request
     else {
         return None;
     };
-    let meta = meta.as_object()?;
+
+    // Determine which branch applies based on the approval kind.
+    let approval_kind = meta
+        .as_ref()
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.get(MCP_TOOL_APPROVAL_KIND_KEY))
+        .and_then(serde_json::Value::as_str);
+
+    match approval_kind {
+        Some(MCP_TOOL_APPROVAL_KIND_MCP_TOOL_CALL) => {
+            build_mcp_tool_approval_permission(server_name, request_id, message, meta, raw_input)
+        }
+        None if is_message_only_elicitation_schema(requested_schema) => {
+            build_message_only_mcp_permission(server_name, request_id, message, raw_input)
+        }
+        _ => None,
+    }
+}
+
+fn build_mcp_tool_approval_permission(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+    message: &str,
+    meta: &Option<serde_json::Value>,
+    raw_input: serde_json::Value,
+) -> Option<SupportedMcpElicitationPermissionRequest> {
+    let meta = meta.as_ref()?.as_object()?;
     if meta
         .get(MCP_TOOL_APPROVAL_KIND_KEY)
         .and_then(serde_json::Value::as_str)
@@ -650,6 +817,62 @@ fn build_supported_mcp_elicitation_permission_request(
                 .title(title)
                 .content(vec![ToolCallContent::Content(Content::new(
                     ContentBlock::Text(TextContent::new(content)),
+                ))])
+                .raw_input(raw_input),
+        ),
+        options,
+        option_map,
+    })
+}
+
+fn build_message_only_mcp_permission(
+    server_name: &str,
+    request_id: &codex_protocol::mcp::RequestId,
+    message: &str,
+    raw_input: serde_json::Value,
+) -> Option<SupportedMcpElicitationPermissionRequest> {
+    let tool_call_id = format!("mcp-elicitation:{request_id}");
+    let options = vec![
+        PermissionOption::new(
+            MCP_ELICITATION_ACCEPT_OPTION_ID,
+            "Allow",
+            PermissionOptionKind::AllowOnce,
+        ),
+        PermissionOption::new(
+            MCP_ELICITATION_DECLINE_OPTION_ID,
+            "Deny",
+            PermissionOptionKind::RejectOnce,
+        ),
+        PermissionOption::new(
+            MCP_ELICITATION_CANCEL_OPTION_ID,
+            "Cancel",
+            PermissionOptionKind::RejectOnce,
+        ),
+    ];
+    let option_map = HashMap::from([
+        (
+            MCP_ELICITATION_ACCEPT_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::accept(),
+        ),
+        (
+            MCP_ELICITATION_DECLINE_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::decline(),
+        ),
+        (
+            MCP_ELICITATION_CANCEL_OPTION_ID.to_string(),
+            ResolvedMcpElicitation::cancel(),
+        ),
+    ]);
+
+    Some(SupportedMcpElicitationPermissionRequest {
+        request_key: mcp_elicitation_request_key(server_name, request_id),
+        tool_call: ToolCallUpdate::new(
+            ToolCallId::new(tool_call_id),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Pending)
+                .title("Approve MCP request".to_string())
+                .content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(message.trim())),
                 ))])
                 .raw_input(raw_input),
         ),
@@ -782,6 +1005,90 @@ fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
     }
 }
 
+// --- Hook helpers ---
+
+fn hook_tool_call_id(hook_id: &str) -> String {
+    format!("codex-hook-{hook_id}")
+}
+
+fn hook_title(run: &HookRunSummary) -> String {
+    format!("Hook: {}", hook_event_name_label(run.event_name))
+}
+
+fn hook_meta(run: &HookRunSummary) -> Meta {
+    Meta::from_iter([(
+        ANYHARNESS_META_KEY.to_string(),
+        json!({
+            "nativeToolName": "CodexHook",
+            "toolKind": "hook",
+            "hookId": run.id,
+            "hookStatus": hook_status_label(run.status),
+        }),
+    )])
+}
+
+fn hook_event_name_label(event_name: HookEventName) -> &'static str {
+    match event_name {
+        HookEventName::PreToolUse => "Pre Tool Use",
+        HookEventName::PermissionRequest => "Permission Request",
+        HookEventName::PostToolUse => "Post Tool Use",
+        HookEventName::PreCompact => "Pre Compact",
+        HookEventName::PostCompact => "Post Compact",
+        HookEventName::SessionStart => "Session Start",
+        HookEventName::UserPromptSubmit => "User Prompt Submit",
+        HookEventName::SubagentStart => "Subagent Start",
+        HookEventName::SubagentStop => "Subagent Stop",
+        HookEventName::Stop => "Stop",
+    }
+}
+
+fn hook_status_label(status: HookRunStatus) -> &'static str {
+    match status {
+        HookRunStatus::Running => "Running",
+        HookRunStatus::Completed => "Completed",
+        HookRunStatus::Failed => "Failed",
+        HookRunStatus::Blocked => "Blocked",
+        HookRunStatus::Stopped => "Stopped",
+    }
+}
+
+fn hook_output_entry_kind_label(kind: HookOutputEntryKind) -> &'static str {
+    match kind {
+        HookOutputEntryKind::Warning => "Warning",
+        HookOutputEntryKind::Stop => "Stop",
+        HookOutputEntryKind::Feedback => "Feedback",
+        HookOutputEntryKind::Context => "Context",
+        HookOutputEntryKind::Error => "Error",
+    }
+}
+
+fn hook_tool_content(run: &HookRunSummary) -> Vec<ToolCallContent> {
+    let mut lines = Vec::new();
+    if let Some(message) = run
+        .status_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        lines.push(message.to_string());
+    }
+    for entry in &run.entries {
+        let text = entry.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "{}: {text}",
+            hook_output_entry_kind_label(entry.kind)
+        ));
+    }
+    if lines.is_empty() {
+        Vec::new()
+    } else {
+        vec![ToolCallContent::Content(Content::new(lines.join("\n")))]
+    }
+}
+
 enum SubmissionState {
     /// User prompts, including slash commands like /init, /review, /compact.
     Prompt(PromptState),
@@ -859,6 +1166,10 @@ struct PromptState {
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
     seen_reasoning_deltas: bool,
+    /// Stable UUIDv4 per Codex item_id, so all AgentMessageChunk deltas share one message_id.
+    agent_message_ids_by_item_id: HashMap<String, String>,
+    /// Stable message_id for transient-status chunks within one turn; reset on turn start/complete.
+    transient_status_message_id: Option<String>,
 }
 
 impl PromptState {
@@ -882,7 +1193,22 @@ impl PromptState {
             response_tx: Some(response_tx),
             seen_message_deltas: false,
             seen_reasoning_deltas: false,
+            agent_message_ids_by_item_id: HashMap::new(),
+            transient_status_message_id: None,
         }
+    }
+
+    fn agent_message_id_for_item(&mut self, item_id: &str) -> String {
+        self.agent_message_ids_by_item_id
+            .entry(item_id.to_string())
+            .or_insert_with(|| Uuid::new_v4().to_string())
+            .clone()
+    }
+
+    fn transient_status_message_id(&mut self) -> String {
+        self.transient_status_message_id
+            .get_or_insert_with(|| Uuid::new_v4().to_string())
+            .clone()
     }
 
     fn is_active(&self) -> bool {
@@ -1124,6 +1450,7 @@ impl PromptState {
                 ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
+                self.transient_status_message_id = None;
             }
             EventMsg::TokenCount(TokenCountEvent { info, .. }) => {
                 if let Some(info) = info
@@ -1155,7 +1482,8 @@ impl PromptState {
             }) => {
                 info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
                 self.seen_message_deltas = true;
-                client.send_agent_text(delta);
+                let message_id = self.agent_message_id_for_item(&item_id);
+                client.send_agent_text_with_message_id(delta, message_id);
             }
             EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
                 thread_id,
@@ -1347,12 +1675,22 @@ impl PromptState {
                 completed_at_ms: _,
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                // Emit a zero-text completion marker so consumers know the full
+                // assistant message is done.
+                if let TurnItem::AgentMessage(agent_message) = &item {
+                    let item_id = agent_message.id.clone();
+                    if let Some(message_id) = self.agent_message_ids_by_item_id.get(&item_id).cloned() {
+                        client.send_agent_message_completed(message_id, item_id.clone());
+                    }
+                    self.agent_message_ids_by_item_id.remove(&item_id);
+                }
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, completed_at: _, duration_ms: _, time_to_first_token_ms: _, }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
                 );
+                self.transient_status_message_id = None;
                 self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
@@ -1383,6 +1721,7 @@ impl PromptState {
             }
             EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id, completed_at: _, duration_ms: _ }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
+                self.transient_status_message_id = None;
                 self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
@@ -1472,11 +1811,34 @@ impl PromptState {
                 self.guardian_assessment(client, event);
             }
 
+            EventMsg::HookStarted(event) => {
+                info!("Hook started: id={}", event.run.id);
+                self.hook_started(client, event);
+            }
+            EventMsg::HookCompleted(event) => {
+                info!("Hook completed: id={}", event.run.id);
+                self.hook_completed(client, event);
+            }
+            EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
+                let mut message = format!("Warning: {}", summary.trim());
+                if let Some(details) = details.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                    message.push_str("\n\n");
+                    message.push_str(details);
+                }
+                client.send_agent_text(message);
+            }
+            EventMsg::RequestUserInput(event) => {
+                info!("Request user input: call_id={}", event.call_id);
+                if let Err(err) = self.request_user_input(client, event).await
+                    && let Some(response_tx) = self.response_tx.take()
+                {
+                    drop(response_tx.send(Err(err)));
+                }
+            }
+
             // Ignore these events
             EventMsg::AgentReasoningRawContent(..)
             | EventMsg::ThreadRolledBack(..)
-            | EventMsg::HookStarted(..)
-            | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
             | EventMsg::ThreadSettingsApplied(..)
@@ -1499,12 +1861,187 @@ impl PromptState {
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)=> {}
-            e @ (EventMsg::RealtimeConversationListVoicesResponse(..)
-            | EventMsg::DeprecationNotice(..)
-            | EventMsg::RequestUserInput(..)) => {
+            e @ EventMsg::RealtimeConversationListVoicesResponse(..) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
+    }
+
+    fn hook_started(&self, client: &SessionClient, event: HookStartedEvent) {
+        let call_id = hook_tool_call_id(&event.run.id);
+        let content = hook_tool_content(&event.run);
+        let mut tool_call = ToolCall::new(call_id, hook_title(&event.run))
+            .kind(ToolKind::Other)
+            .status(ToolCallStatus::InProgress)
+            .meta(hook_meta(&event.run));
+        if !content.is_empty() {
+            tool_call = tool_call.content(content);
+        }
+        client.send_tool_call(tool_call);
+    }
+
+    fn hook_completed(&self, client: &SessionClient, event: HookCompletedEvent) {
+        let status = match event.run.status {
+            HookRunStatus::Completed => ToolCallStatus::Completed,
+            HookRunStatus::Running => ToolCallStatus::InProgress,
+            HookRunStatus::Blocked | HookRunStatus::Failed | HookRunStatus::Stopped => {
+                ToolCallStatus::Failed
+            }
+        };
+        let content = hook_tool_content(&event.run);
+        let mut fields = ToolCallUpdateFields::new()
+            .title(hook_title(&event.run))
+            .kind(ToolKind::Other)
+            .status(status);
+        if !content.is_empty() {
+            fields = fields.content(content);
+        }
+        client.send_tool_call_update(
+            ToolCallUpdate::new(hook_tool_call_id(&event.run.id), fields)
+                .meta(hook_meta(&event.run)),
+        );
+    }
+
+    async fn request_user_input(
+        &mut self,
+        client: &SessionClient,
+        event: RequestUserInputEvent,
+    ) -> Result<(), Error> {
+        let turn_id = if event.turn_id.is_empty() {
+            self.submission_id.clone()
+        } else {
+            event.turn_id.clone()
+        };
+
+        let call_id = event.call_id.clone();
+        if !client.supports_request_user_input() {
+            warn!(
+                call_id = %call_id,
+                turn_id = %turn_id,
+                question_count = event.questions.len(),
+                "request_user_input extension is not supported by client; submitting empty answer"
+            );
+            self.thread
+                .submit(Op::UserInputAnswer {
+                    id: call_id,
+                    response: RequestUserInputResponse {
+                        answers: HashMap::new(),
+                    },
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            return Ok(());
+        }
+
+        let params = Self::codex_request_user_input_params(&event, &turn_id);
+        let ext_response = match client.ext_method_typed::<CodexRequestUserInputExtResponse>(
+            CODEX_REQUEST_USER_INPUT_EXT_METHOD,
+            &params,
+        ).await {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    call_id = %call_id,
+                    "request_user_input extension failed before response delivery; submitting empty answer: {err:?}"
+                );
+                self.thread
+                    .submit(Op::UserInputAnswer {
+                        id: call_id,
+                        response: RequestUserInputResponse {
+                            answers: HashMap::new(),
+                        },
+                    })
+                    .await
+                    .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+                return Ok(());
+            }
+        };
+
+        let response = Self::codex_request_user_input_response(ext_response);
+        self.thread
+            .submit(Op::UserInputAnswer { id: call_id, response })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        Ok(())
+    }
+
+    fn codex_request_user_input_params(
+        event: &RequestUserInputEvent,
+        turn_id: &str,
+    ) -> CodexRequestUserInputExtParams {
+        CodexRequestUserInputExtParams {
+            call_id: event.call_id.clone(),
+            turn_id: turn_id.to_string(),
+            questions: event
+                .questions
+                .iter()
+                .map(Self::codex_request_user_input_question)
+                .collect(),
+        }
+    }
+
+    fn codex_request_user_input_question(
+        question: &RequestUserInputQuestion,
+    ) -> CodexRequestUserInputExtQuestion {
+        CodexRequestUserInputExtQuestion {
+            question_id: question.id.clone(),
+            header: question.header.clone(),
+            question: question.question.clone(),
+            is_other: question.is_other,
+            is_secret: question.is_secret,
+            options: question
+                .options
+                .as_ref()
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(Self::codex_request_user_input_option)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn codex_request_user_input_option(
+        option: &RequestUserInputQuestionOption,
+    ) -> CodexRequestUserInputExtOption {
+        CodexRequestUserInputExtOption {
+            label: option.label.clone(),
+            description: option.description.clone(),
+        }
+    }
+
+    fn codex_request_user_input_response(
+        response: CodexRequestUserInputExtResponse,
+    ) -> RequestUserInputResponse {
+        if response.outcome != CodexRequestUserInputExtOutcome::Submitted {
+            return RequestUserInputResponse {
+                answers: HashMap::new(),
+            };
+        }
+
+        let answers = response
+            .answers
+            .into_iter()
+            .map(|answer| {
+                let mut entries = Vec::new();
+                if let Some(label) = answer.selected_option_label {
+                    entries.push(label);
+                }
+                if let Some(text) = answer.text {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        entries.push(format!("user_note: {text}"));
+                    }
+                }
+                (
+                    answer.question_id,
+                    RequestUserInputAnswer { answers: entries },
+                )
+            })
+            .collect();
+
+        RequestUserInputResponse { answers }
     }
 
     async fn mcp_elicitation(
@@ -1548,6 +2085,44 @@ impl PromptState {
             ElicitationRequest::Url { .. } => "url",
         };
 
+        // Fall back to the ext method if the client supports it.
+        if client.supports_mcp_elicitation() {
+            let response = match client
+                .ext_method_typed::<CodexMcpElicitationExtResponse>(
+                    CODEX_MCP_ELICITATION_EXT_METHOD,
+                    &CodexMcpElicitationExtParams {
+                        server_name: server_name.clone(),
+                        request: request.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!(
+                        "mcp_elicitation extension failed before response delivery; declining: {err:?}"
+                    );
+                    CodexMcpElicitationExtResponse {
+                        outcome: CodexMcpElicitationExtOutcome::Declined,
+                        content: None,
+                        meta: None,
+                    }
+                }
+            };
+            let (decision, content, meta) = Self::codex_mcp_elicitation_response(response);
+            self.thread
+                .submit(Op::ResolveElicitation {
+                    server_name,
+                    request_id: id,
+                    decision,
+                    content,
+                    meta,
+                })
+                .await
+                .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+            return Ok(());
+        }
+
         info!(
             "Auto-declining unsupported MCP elicitation: server={}, id={:?}, kind={request_kind}",
             server_name, id
@@ -1565,6 +2140,18 @@ impl PromptState {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
         Ok(())
+    }
+
+    fn codex_mcp_elicitation_response(
+        response: CodexMcpElicitationExtResponse,
+    ) -> (ElicitationAction, Option<Value>, Option<Value>) {
+        match response.outcome {
+            CodexMcpElicitationExtOutcome::Accepted => {
+                (ElicitationAction::Accept, response.content, response.meta)
+            }
+            CodexMcpElicitationExtOutcome::Declined => (ElicitationAction::Decline, None, None),
+            CodexMcpElicitationExtOutcome::Cancelled => (ElicitationAction::Cancel, None, None),
+        }
     }
 
     fn review_mode_exit(
@@ -2640,6 +3227,29 @@ impl SessionClient {
                 })
     }
 
+    fn supports_request_user_input(&self) -> bool {
+        self.supports_codex_capability("requestUserInput")
+    }
+
+    fn supports_mcp_elicitation(&self) -> bool {
+        self.supports_codex_capability("mcpElicitation")
+    }
+
+    fn supports_codex_capability(&self, capability: &str) -> bool {
+        self.client_capabilities
+            .lock()
+            .unwrap()
+            .meta
+            .as_ref()
+            .is_some_and(|v| {
+                v.get("codex").is_some_and(|codex| {
+                    codex
+                        .get(capability)
+                        .is_some_and(|enabled| enabled.as_bool().unwrap_or_default())
+                })
+            })
+    }
+
     fn send_notification(&self, update: SessionUpdate) {
         if let Err(e) = self
             .client
@@ -2659,6 +3269,64 @@ impl SessionClient {
         self.send_notification(SessionUpdate::AgentMessageChunk(ContentChunk::new(
             text.into().into(),
         )));
+    }
+
+    fn send_agent_text_with_message_id(
+        &self,
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(text.into().into()).message_id(MessageId::new(message_id.into())),
+        ));
+    }
+
+    fn send_agent_message_completed(
+        &self,
+        message_id: impl Into<String>,
+        codex_item_id: impl Into<String>,
+    ) {
+        self.send_notification(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new("".into())
+                .message_id(MessageId::new(message_id.into()))
+                .meta(Meta::from_iter([(
+                    ANYHARNESS_META_KEY.to_string(),
+                    json!({
+                        "transcriptEvent": ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT,
+                        "codexItemId": codex_item_id.into(),
+                    }),
+                )])),
+        ));
+    }
+
+    fn send_transient_status(&self, text: impl Into<String>, message_id: impl Into<String>) {
+        self.send_notification(SessionUpdate::AgentThoughtChunk(
+            ContentChunk::new(text.into().into())
+                .message_id(MessageId::new(message_id.into()))
+                .meta(Meta::from_iter([(
+                    ANYHARNESS_META_KEY.to_string(),
+                    json!({
+                        "transcriptEvent": ANYHARNESS_TRANSIENT_STATUS_EVENT,
+                    }),
+                )])),
+        ));
+    }
+
+    async fn ext_method_typed<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: &impl Serialize,
+    ) -> Result<T, Error> {
+        let params_str = serde_json::to_string(params)
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let params = RawValue::from_string(params_str)
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        let response = self
+            .client
+            .ext_method(ExtRequest::new(method, params.into()))
+            .await?;
+        serde_json::from_str::<T>(response.0.get())
+            .map_err(|e| Error::invalid_params().data(e.to_string()))
     }
 
     fn send_agent_thought(&self, text: impl Into<String>) {
@@ -5119,6 +5787,15 @@ mod tests {
                     .unwrap_or_else(|| {
                         RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                     }))
+            })
+        }
+
+        fn ext_method(
+            &self,
+            _req: ExtRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ExtResponse, Error>> + Send + '_>> {
+            Box::pin(async move {
+                Err(Error::internal_error().data("ext_method not supported in StubClient"))
             })
         }
     }
