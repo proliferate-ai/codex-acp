@@ -19,6 +19,7 @@
     "${ARCH}"
   ],
   "files": [
-    "bin"
+    "bin",
+    "codex-resources"
   ]
 }
