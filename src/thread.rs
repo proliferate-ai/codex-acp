@@ -150,6 +150,9 @@ const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 // Anyharness meta keys and event names
 const ANYHARNESS_META_KEY: &str = "anyharness";
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
+// TODO: re-wire transient status events (0.16 port gap — the 0.11 lineage
+// emitted these and the anyharness sink still consumes them).
+#[allow(dead_code)]
 const ANYHARNESS_TRANSIENT_STATUS_EVENT: &str = "transient_status";
 
 // Extension method names
@@ -1206,6 +1209,8 @@ impl PromptState {
             .clone()
     }
 
+    // TODO: re-wire transient status events (0.16 port gap).
+    #[allow(dead_code)]
     fn transient_status_message_id(&mut self) -> String {
         self.transient_status_message_id
             .get_or_insert_with(|| Uuid::new_v4().to_string())
@@ -3306,6 +3311,8 @@ impl SessionClient {
         ));
     }
 
+    // TODO: re-wire transient status events (0.16 port gap).
+    #[allow(dead_code)]
     fn send_transient_status(&self, text: impl Into<String>, message_id: impl Into<String>) {
         self.send_notification(SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(text.into().into())
