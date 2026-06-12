@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -6,20 +7,20 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
-use serde::{Deserialize, Serialize};
 
 use agent_client_protocol::{
     Client, ConnectionTo, Error,
     schema::{
         AgentRequest, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
-        ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk,
-        Diff, EmbeddedResource, EmbeddedResourceResource, ExtRequest, ExtResponse, ImageContent,
+        ClientCapabilities, ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff,
+        EmbeddedResource, EmbeddedResourceResource, ExtRequest, ExtResponse, ImageContent,
         LoadSessionResponse, MessageId, Meta, PermissionOption, PermissionOptionKind, Plan,
         PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
-        RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
-        SessionConfigId, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-        SessionConfigSelectOption, SessionConfigValueId, SessionId, SessionMode, SessionModeId,
-        SessionModeState, SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
+        RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
+        SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+        SessionConfigValueId, SessionId, SessionMode, SessionModeId, SessionModeState,
+        SessionNotification, SessionUpdate, StopReason, Terminal, TextContent,
         TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
         UsageUpdate,
@@ -39,10 +40,10 @@ use codex_protocol::{
         ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction,
         GuardianCommandSource,
     },
-    items::TurnItem,
     config_types::TrustLevel,
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
+    items::TurnItem,
     mcp::CallToolResult,
     models::{
         ActivePermissionProfile, AdditionalPermissionProfile, PermissionProfile, ResponseItem,
@@ -1934,10 +1935,13 @@ impl PromptState {
         }
 
         let params = Self::codex_request_user_input_params(&event, &turn_id);
-        let ext_response = match client.ext_method_typed::<CodexRequestUserInputExtResponse>(
-            CODEX_REQUEST_USER_INPUT_EXT_METHOD,
-            &params,
-        ).await {
+        let ext_response = match client
+            .ext_method_typed::<CodexRequestUserInputExtResponse>(
+                CODEX_REQUEST_USER_INPUT_EXT_METHOD,
+                &params,
+            )
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 warn!(
@@ -1959,7 +1963,10 @@ impl PromptState {
 
         let response = Self::codex_request_user_input_response(ext_response);
         self.thread
-            .submit(Op::UserInputAnswer { id: call_id, response })
+            .submit(Op::UserInputAnswer {
+                id: call_id,
+                response,
+            })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         Ok(())
