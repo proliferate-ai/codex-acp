@@ -421,7 +421,7 @@ jobs:
                   echo "Skipping ${PACKAGE_NAME}@${PACKAGE_VERSION}; already published"
                 else
                   echo "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION}"
-                  npm publish --access public
+                  npm publish --access public --tag latest
                 fi
               )
             fi
@@ -470,7 +470,7 @@ jobs:
             echo "Skipping ${PACKAGE_NAME}@${PACKAGE_VERSION}; already published"
           else
             echo "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION}"
-            npm publish --access public
+            npm publish --access public --tag latest
           fi
 
   create-release:
