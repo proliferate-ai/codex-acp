@@ -18,19 +18,19 @@ echo
 
 mkdir -p "$OUTPUT_DIR"
 
-# Define platform mappings as "target|npm-os|npm-arch|binary-extension".
-# Note: We only package gnu variants for Linux.
-platforms=(
-  "aarch64-apple-darwin|darwin|arm64|"
-  "x86_64-apple-darwin|darwin|x64|"
-  "x86_64-unknown-linux-gnu|linux|x64|"
-  "aarch64-unknown-linux-gnu|linux|arm64|"
-  "x86_64-pc-windows-msvc|win32|x64|.exe"
-  "aarch64-pc-windows-msvc|win32|arm64|.exe"
+# Define platform mappings: target -> (npm-os, npm-arch, binary-extension)
+# Note: We only package gnu variants for Linux
+declare -A platforms=(
+  ["aarch64-apple-darwin"]="darwin arm64 "
+  ["x86_64-apple-darwin"]="darwin x64 "
+  ["x86_64-unknown-linux-gnu"]="linux x64 "
+  ["aarch64-unknown-linux-gnu"]="linux arm64 "
+  ["x86_64-pc-windows-msvc"]="win32 x64 .exe"
+  ["aarch64-pc-windows-msvc"]="win32 arm64 .exe"
 )
 
-for platform in "${platforms[@]}"; do
-  IFS='|' read -r target os arch ext <<< "$platform"
+for target in "${!platforms[@]}"; do
+  read os arch ext <<< "${platforms[$target]}"
 
   # Determine archive extension
   if [[ "$os" == "win32" ]]; then
@@ -59,6 +59,16 @@ for platform in "${platforms[@]}"; do
     unzip -q -j "$archive_path" "codex-acp${ext}" -d "${pkg_dir}/bin/"
   else
     tar xzf "$archive_path" -C "${pkg_dir}/bin/" "codex-acp${ext}"
+  fi
+
+  if [[ "$os" == "linux" ]]; then
+    if tar tzf "$archive_path" | grep -qx "codex-resources/bwrap"; then
+      tar xzf "$archive_path" -C "${pkg_dir}" "codex-resources/bwrap"
+      chmod +x "${pkg_dir}/codex-resources/bwrap"
+    else
+      echo "Missing bundled bwrap in Linux archive: $archive_path" >&2
+      exit 1
+    fi
   fi
 
   # Make binary executable (important for Unix-like systems)

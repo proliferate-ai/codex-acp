@@ -7,14 +7,6 @@ on:
         description: "Tag name for release (optional - uses version from Cargo.toml if not specified)"
         required: false
         type: string
-      publish_profile:
-        description: "Artifact profile to publish"
-        required: false
-        default: "all"
-        type: choice
-        options:
-          - all
-          - linux-x64
 
 permissions:
   contents: write
@@ -50,14 +42,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: >-
-          ${{
-            fromJSON(
-              github.event.inputs.publish_profile == 'linux-x64' &&
-              '[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_extension":""}]' ||
-              '[{"os":"macos-14","target":"aarch64-apple-darwin","binary_extension":""},{"os":"macos-14","target":"x86_64-apple-darwin","binary_extension":""},{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","binary_extension":""},{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","binary_extension":""},{"os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-musl","binary_extension":""},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","binary_extension":".exe"},{"os":"windows-11-arm","target":"aarch64-pc-windows-msvc","binary_extension":".exe"}]'
-            )
-          }}
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary_extension: ""
+          - os: macos-14
+            target: x86_64-apple-darwin
+            binary_extension: ""
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary_extension: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary_extension: ""
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary_extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_extension: ".exe"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary_extension: ".exe"
 
     runs-on: ${{ matrix.os }}
 
@@ -210,29 +218,17 @@ jobs:
           # build does the same (see MODULE.bazel).
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >> "$GITHUB_ENV"
 
+      - name: Install bundled bwrap (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-bundled-bwrap.sh"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Detect macOS signing configuration
-        id: macos_signing
-        if: startsWith(matrix.os, 'macos')
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
-          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
-          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${MACOS_CERTIFICATE}" && -n "${MACOS_CERTIFICATE_PASSWORD}" && -n "${APPLE_NOTARIZATION_KEY}" && -n "${APPLE_NOTARIZATION_KEY_ID}" && -n "${APPLE_NOTARIZATION_ISSUER_ID}" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Code sign macOS binary
-        if: startsWith(matrix.os, 'macos') && steps.macos_signing.outputs.enabled == 'true'
+        if: startsWith(matrix.os, 'macos')
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -242,27 +238,8 @@ jobs:
         run: |
           ./script/sign-mac target/${{ matrix.target }}/release/codex-acp
 
-      - name: Detect Windows signing configuration
-        id: windows_signing
-        if: startsWith(matrix.os, 'windows')
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
-          ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
-          CERT_PROFILE_NAME: ${{ vars.AZURE_SIGNING_CERT_PROFILE_NAME }}
-          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${AZURE_TENANT_ID}" && -n "${AZURE_CLIENT_ID}" && -n "${AZURE_CLIENT_SECRET}" && -n "${ACCOUNT_NAME}" && -n "${CERT_PROFILE_NAME}" && -n "${ENDPOINT}" ]]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Code sign Windows binary
-        if: startsWith(matrix.os, 'windows') && steps.windows_signing.outputs.enabled == 'true'
+        if: startsWith(matrix.os, 'windows')
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
@@ -291,7 +268,14 @@ jobs:
             echo "archive_name=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
             mv "${ARCHIVE_NAME}.zip" ../../../
           else
-            tar czf "${ARCHIVE_NAME}.tar.gz" "${BINARY_NAME}"
+            archive_items=("${BINARY_NAME}")
+            if [[ "${{ runner.os }}" == "Linux" ]]; then
+              mkdir -p codex-resources
+              cp bwrap codex-resources/bwrap
+              chmod 0755 codex-resources/bwrap
+              archive_items+=(codex-resources/bwrap)
+            fi
+            tar czf "${ARCHIVE_NAME}.tar.gz" "${archive_items[@]}"
             echo "archive_path=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
             echo "archive_name=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
             mv "${ARCHIVE_NAME}.tar.gz" ../../../
@@ -353,11 +337,8 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    # Publishing is intentionally dispatch-only; tag/push triggers should not infer this input.
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile == 'all' }}
+    if: ${{ !github.event.repository.fork }}
     environment: release # Optional: for enhanced security
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
       id-token: write
@@ -381,18 +362,10 @@ jobs:
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
-              (
-                cd "$pkg"
-                PACKAGE_NAME=$(node -p "require('./package.json').name")
-                PACKAGE_VERSION=$(node -p "require('./package.json').version")
-
-                if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-                  echo "Skipping ${PACKAGE_NAME}@${PACKAGE_VERSION}; already published"
-                else
-                  echo "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION}"
-                  npm publish --access public
-                fi
-              )
+              echo "Publishing $(basename $pkg)..."
+              cd "$pkg"
+              npm publish
+              cd ../..
             fi
           done
 
@@ -400,11 +373,8 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    # Publishing is intentionally dispatch-only; tag/push triggers should not infer this input.
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile == 'all' }}
+    if: ${{ !github.event.repository.fork }}
     environment: release # Optional: for enhanced security
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
       id-token: write
@@ -432,22 +402,12 @@ jobs:
       - name: Publish base package
         run: |
           cd npm
-          PACKAGE_NAME=$(node -p "require('./package.json').name")
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-
-          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-            echo "Skipping ${PACKAGE_NAME}@${PACKAGE_VERSION}; already published"
-          else
-            echo "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION}"
-            npm publish --access public
-          fi
+          npm publish
 
   create-release:
     name: Create Release
     needs: [get-version, build, publish-npm-base]
     runs-on: ubuntu-latest
-    # Release creation tracks the full publish path, not linux-only smoke dispatches.
-    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile == 'all' }}
 
     steps:
       - uses: actions/checkout@v4

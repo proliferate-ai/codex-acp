@@ -17,7 +17,6 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - /init
   - /compact
   - /logout
-  - Custom Prompts
 - Client MCP servers
 - Auth Methods:
   - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
@@ -42,7 +41,7 @@ Or try it with any of the other [ACP compatible clients](https://agentclientprot
 
 #### Installation
 
-Install the adapter from the latest release for your architecture and OS: https://github.com/proliferate-ai/codex-acp/releases
+Install the adapter from the latest release for your architecture and OS: https://github.com/zed-industries/codex-acp/releases
 
 You can then use `codex-acp` as a regular ACP agent:
 
@@ -53,7 +52,7 @@ OPENAI_API_KEY=sk-... codex-acp
 Or via npm:
 
 ```
-npx @proliferateai/codex-acp
+npx @zed-industries/codex-acp
 ```
 
 ## License
