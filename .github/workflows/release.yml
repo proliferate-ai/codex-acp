@@ -7,6 +7,14 @@ on:
         description: "Tag name for release (optional - uses version from Cargo.toml if not specified)"
         required: false
         type: string
+      publish_profile:
+        description: "all = publish npm packages + create release; linux-x64 = build-only smoke run"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - linux-x64
 
 permissions:
   contents: write
@@ -337,8 +345,11 @@ jobs:
     name: Publish NPM Platform Packages
     needs: [get-version, npm-packages]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    # Publishing is intentionally dispatch-only with the full profile.
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile != 'linux-x64' }}
     environment: release # Optional: for enhanced security
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
       id-token: write
@@ -362,10 +373,18 @@ jobs:
         run: |
           for pkg in npm-packages/*; do
             if [ -d "$pkg" ]; then
-              echo "Publishing $(basename $pkg)..."
-              cd "$pkg"
-              npm publish
-              cd ../..
+              (
+                cd "$pkg"
+                PACKAGE_NAME=$(node -p "require('./package.json').name")
+                PACKAGE_VERSION=$(node -p "require('./package.json').version")
+
+                if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+                  echo "Skipping ${PACKAGE_NAME}@${PACKAGE_VERSION}; already published"
+                else
+                  echo "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION}"
+                  npm publish --access public
+                fi
+              )
             fi
           done
 
@@ -373,8 +392,11 @@ jobs:
     name: Publish NPM Base Package
     needs: [get-version, npm-packages, publish-npm-platform]
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork }}
+    # Publishing is intentionally dispatch-only with the full profile.
+    if: ${{ github.repository == 'proliferate-ai/codex-acp' && github.event_name == 'workflow_dispatch' && github.event.inputs.publish_profile != 'linux-x64' }}
     environment: release # Optional: for enhanced security
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     permissions:
       contents: read
       id-token: write
@@ -402,7 +424,15 @@ jobs:
       - name: Publish base package
         run: |
           cd npm
-          npm publish
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "Skipping ${PACKAGE_NAME}@${PACKAGE_VERSION}; already published"
+          else
+            echo "Publishing ${PACKAGE_NAME}@${PACKAGE_VERSION}"
+            npm publish --access public
+          fi
 
   create-release:
     name: Create Release
