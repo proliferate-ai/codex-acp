@@ -7,19 +7,21 @@ use acp::schema::{
     McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
     NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
     ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionResumeCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse,
+    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionResumeCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse,
 };
-use acp::{Agent, Client, ConnectTo, ConnectionTo, Error};
+use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, Responder};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
-    find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
+    CodexThread, ExternalGoalPreviousStatus, ExternalGoalSet, NewThread, RolloutRecorder,
+    StateDbHandle, ThreadManager, config::Config, find_thread_path_by_id_str, init_state_db,
+    resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
 use codex_extension_api::empty_extension_registry;
+use codex_features::Feature;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
@@ -30,8 +32,9 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource},
+    protocol::{InitialHistory, SessionSource, validate_thread_goal_objective},
 };
+use serde_json::json;
 use codex_thread_store::{
     ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
     ThreadStore,
@@ -44,6 +47,10 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::goals::{
+    AnyharnessGoalRequest, GOAL_CLEARED_EVENT, GoalSessionParams, GoalSetParams,
+    GoalSetStatusParam, GoalWire, goal_notification_update, initialize_capability_meta,
+};
 use crate::thread::{ConfiguredModelsManager, Thread};
 
 /// The Codex implementation of the ACP Agent.
@@ -306,6 +313,23 @@ impl CodexAgent {
                 },
                 acp::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: AnyharnessGoalRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        let session_cx = cx.clone();
+                        cx.spawn(async move {
+                            agent.handle_goal_request(request, responder, session_cx).await;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
             .connect_to(transport)
             .await
     }
@@ -478,7 +502,8 @@ impl CodexAgent {
         Ok(InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_capabilities)
             .agent_info(Implementation::new("codex-acp", env!("CARGO_PKG_VERSION")).title("Codex"))
-            .auth_methods(auth_methods))
+            .auth_methods(auth_methods)
+            .meta(initialize_capability_meta()))
     }
 
     async fn authenticate(
@@ -858,6 +883,323 @@ impl CodexAgent {
         let config_options = thread.config_options().await?;
 
         Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
+}
+
+/// Resolved thread context for a goal ext-method call.
+///
+/// Goals require a persisted (non-ephemeral) thread and a sqlite state db;
+/// the thread does not need to be running.
+struct GoalThreadContext {
+    thread_id: ThreadId,
+    state_db: StateDbHandle,
+    rollout_path: PathBuf,
+    running_thread: Option<Arc<CodexThread>>,
+}
+
+/// Anyharness GoalPort ext methods (`_anyharness/goal/set|get|clear`).
+///
+/// Ports the app-server `ThreadGoalRequestProcessor` semantics from codex
+/// rust-v0.137.0 onto the ACP surface: persist goal mutations through the
+/// state-db `GoalStore`, then apply runtime effects on the running thread via
+/// `ExternalGoalSet` / external clear. Every successful mutation additionally
+/// emits a tagged zero-length `AgentMessageChunk` notification.
+impl CodexAgent {
+    async fn handle_goal_request(
+        &self,
+        request: AnyharnessGoalRequest,
+        responder: Responder<serde_json::Value>,
+        cx: ConnectionTo<Client>,
+    ) {
+        match request {
+            AnyharnessGoalRequest::Set(params) => {
+                let session_id = SessionId::new(params.session_id.clone());
+                match self.goal_set(params).await {
+                    Ok((goal_wire, running_thread, external_set)) => {
+                        let transcript_event = goal_wire.transcript_event();
+                        respond_json(responder, json!({ "goal": goal_wire }));
+                        Self::send_goal_notification(
+                            &cx,
+                            session_id,
+                            transcript_event,
+                            Some(&goal_wire),
+                        );
+                        if let Some(thread) = running_thread {
+                            thread.apply_external_goal_set(external_set).await;
+                        }
+                    }
+                    Err(error) => respond_error(responder, error),
+                }
+            }
+            AnyharnessGoalRequest::Get(params) => {
+                let result = self.goal_get(params).await;
+                if let Err(e) = responder.respond_with_result(result) {
+                    tracing::error!("failed to respond to goal/get: {e:?}");
+                }
+            }
+            AnyharnessGoalRequest::Clear(params) => {
+                let session_id = SessionId::new(params.session_id.clone());
+                match self.goal_clear(params).await {
+                    Ok((cleared, running_thread)) => {
+                        if cleared {
+                            if let Some(thread) = running_thread.as_ref() {
+                                thread.apply_external_goal_clear().await;
+                            }
+                        }
+                        respond_json(responder, json!({ "cleared": cleared }));
+                        if cleared {
+                            Self::send_goal_notification(&cx, session_id, GOAL_CLEARED_EVENT, None);
+                        }
+                    }
+                    Err(error) => respond_error(responder, error),
+                }
+            }
+        }
+    }
+
+    async fn goal_set(
+        &self,
+        params: GoalSetParams,
+    ) -> Result<(GoalWire, Option<Arc<CodexThread>>, ExternalGoalSet), Error> {
+        self.ensure_goals_enabled()?;
+        let ctx = self.goal_thread_context(&params.session_id).await?;
+        self.reconcile_goal_rollout(&ctx).await;
+
+        let objective = params.objective.as_deref().map(str::trim);
+        if let Some(objective) = objective {
+            validate_thread_goal_objective(objective)
+                .map_err(|e| Error::invalid_params().data(e))?;
+        }
+        if objective.is_some() || params.token_budget.is_some() {
+            validate_goal_budget(params.token_budget.flatten())
+                .map_err(|e| Error::invalid_params().data(e))?;
+        }
+
+        if let Some(thread) = ctx.running_thread.as_ref() {
+            thread.prepare_external_goal_mutation().await;
+        }
+
+        let status = params.status.map(GoalSetStatusParam::to_state);
+        let thread_id = ctx.thread_id;
+        let goals = ctx.state_db.thread_goals();
+
+        let (goal, previous_status) = if let Some(objective) = objective {
+            let existing = goals
+                .get_thread_goal(thread_id)
+                .await
+                .map_err(|e| Error::invalid_params().data(e.to_string()))?;
+            match existing {
+                Some(existing) => {
+                    let previous_status = ExternalGoalPreviousStatus::from(&existing);
+                    let updated = goals
+                        .update_thread_goal(
+                            thread_id,
+                            codex_state::GoalUpdate {
+                                objective: Some(objective.to_string()),
+                                status,
+                                token_budget: params.token_budget,
+                                expected_goal_id: Some(existing.goal_id.clone()),
+                            },
+                        )
+                        .await
+                        .map_err(|e| Error::invalid_params().data(e.to_string()))?
+                        .ok_or_else(|| goal_missing_error(thread_id))?;
+                    (updated, previous_status)
+                }
+                None => {
+                    let created = goals
+                        .replace_thread_goal(
+                            thread_id,
+                            objective,
+                            status.unwrap_or(codex_state::ThreadGoalStatus::Active),
+                            params.token_budget.flatten(),
+                        )
+                        .await
+                        .map_err(|e| Error::invalid_params().data(e.to_string()))?;
+                    (created, ExternalGoalPreviousStatus::NewGoal)
+                }
+            }
+        } else {
+            let existing = goals
+                .get_thread_goal(thread_id)
+                .await
+                .map_err(|e| Error::invalid_params().data(e.to_string()))?
+                .ok_or_else(|| goal_missing_error(thread_id))?;
+            let previous_status = ExternalGoalPreviousStatus::from(&existing);
+            let updated = goals
+                .update_thread_goal(
+                    thread_id,
+                    codex_state::GoalUpdate {
+                        objective: None,
+                        status,
+                        token_budget: params.token_budget,
+                        expected_goal_id: None,
+                    },
+                )
+                .await
+                .map_err(|e| Error::invalid_params().data(e.to_string()))?
+                .ok_or_else(|| goal_missing_error(thread_id))?;
+            (updated, previous_status)
+        };
+
+        if objective.is_some() {
+            if let Err(e) = ctx
+                .state_db
+                .set_thread_preview_if_empty(thread_id, goal.objective.as_str())
+                .await
+            {
+                tracing::warn!(
+                    "failed to set empty thread preview from goal objective for {thread_id}: {e}"
+                );
+            }
+        }
+
+        let external_set = ExternalGoalSet {
+            goal: goal.clone(),
+            previous_status,
+        };
+        Ok((GoalWire::from_state(&goal), ctx.running_thread, external_set))
+    }
+
+    async fn goal_get(&self, params: GoalSessionParams) -> Result<serde_json::Value, Error> {
+        self.ensure_goals_enabled()?;
+        let ctx = self.goal_thread_context(&params.session_id).await?;
+        let goal = ctx
+            .state_db
+            .thread_goals()
+            .get_thread_goal(ctx.thread_id)
+            .await
+            .map_err(|e| {
+                Error::internal_error().data(format!("failed to read thread goal: {e}"))
+            })?;
+        Ok(json!({ "goal": goal.as_ref().map(GoalWire::from_state) }))
+    }
+
+    async fn goal_clear(
+        &self,
+        params: GoalSessionParams,
+    ) -> Result<(bool, Option<Arc<CodexThread>>), Error> {
+        self.ensure_goals_enabled()?;
+        let ctx = self.goal_thread_context(&params.session_id).await?;
+        self.reconcile_goal_rollout(&ctx).await;
+
+        if let Some(thread) = ctx.running_thread.as_ref() {
+            thread.prepare_external_goal_mutation().await;
+        }
+
+        let cleared = ctx
+            .state_db
+            .thread_goals()
+            .delete_thread_goal(ctx.thread_id)
+            .await
+            .map_err(|e| {
+                Error::internal_error().data(format!("failed to clear thread goal: {e}"))
+            })?;
+        Ok((cleared, ctx.running_thread))
+    }
+
+    fn ensure_goals_enabled(&self) -> Result<(), Error> {
+        if self.config.features.enabled(Feature::Goals) {
+            Ok(())
+        } else {
+            Err(Error::invalid_params().data("goals feature is disabled"))
+        }
+    }
+
+    /// Resolve the thread backing `session_id` for goal operations, erroring
+    /// on unknown ids, ephemeral threads, and a missing state db.
+    async fn goal_thread_context(&self, session_id: &str) -> Result<GoalThreadContext, Error> {
+        let thread_id = ThreadId::from_string(session_id)
+            .map_err(|e| Error::invalid_params().data(format!("invalid session id: {e}")))?;
+        let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
+        let (rollout_path, state_db) = match running_thread.as_ref() {
+            Some(thread) => {
+                let rollout_path = thread.rollout_path().ok_or_else(|| {
+                    Error::invalid_params()
+                        .data(format!("ephemeral thread does not support goals: {thread_id}"))
+                })?;
+                (rollout_path, thread.state_db().or_else(|| self.state_db.clone()))
+            }
+            None => {
+                let rollout_path = find_thread_path_by_id_str(
+                    &self.config.codex_home,
+                    &thread_id.to_string(),
+                    self.state_db.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    Error::internal_error()
+                        .data(format!("failed to locate thread id {thread_id}: {e}"))
+                })?
+                .ok_or_else(|| {
+                    Error::invalid_params().data(format!("thread not found: {thread_id}"))
+                })?;
+                (rollout_path, self.state_db.clone())
+            }
+        };
+        let state_db = state_db.ok_or_else(|| {
+            Error::internal_error().data("sqlite state db unavailable for thread goals")
+        })?;
+        Ok(GoalThreadContext {
+            thread_id,
+            state_db,
+            rollout_path,
+            running_thread,
+        })
+    }
+
+    /// Reconcile the rollout into sqlite before a goal mutation so the state
+    /// db has thread metadata for threads that were never listed.
+    async fn reconcile_goal_rollout(&self, ctx: &GoalThreadContext) {
+        codex_rollout::state_db::reconcile_rollout(
+            Some(&ctx.state_db),
+            ctx.rollout_path.as_path(),
+            self.config.model_provider_id.as_str(),
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+    }
+
+    fn send_goal_notification(
+        cx: &ConnectionTo<Client>,
+        session_id: SessionId,
+        transcript_event: &str,
+        goal: Option<&GoalWire>,
+    ) {
+        let update = goal_notification_update(transcript_event, goal);
+        if let Err(e) = cx.send_notification(SessionNotification::new(session_id, update)) {
+            tracing::error!("failed to send goal notification: {e:?}");
+        }
+    }
+}
+
+fn goal_missing_error(thread_id: ThreadId) -> Error {
+    Error::invalid_params().data(format!(
+        "cannot update goal for thread {thread_id}: no goal exists"
+    ))
+}
+
+fn validate_goal_budget(value: Option<i64>) -> Result<(), String> {
+    if let Some(value) = value {
+        if value <= 0 {
+            return Err("goal budgets must be positive when provided".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn respond_json(responder: Responder<serde_json::Value>, value: serde_json::Value) {
+    if let Err(e) = responder.respond(value) {
+        tracing::error!("failed to respond to goal ext method: {e:?}");
+    }
+}
+
+fn respond_error(responder: Responder<serde_json::Value>, error: Error) {
+    if let Err(e) = responder.respond_with_error(error) {
+        tracing::error!("failed to respond to goal ext method with error: {e:?}");
     }
 }
 
