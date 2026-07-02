@@ -71,7 +71,7 @@ use codex_protocol::{
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
+        StreamErrorEvent, TerminalInteractionEvent,
         ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
         TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
         WebSearchBeginEvent, WebSearchEndEvent,
@@ -151,7 +151,7 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 
 // Anyharness meta keys and event names
-const ANYHARNESS_META_KEY: &str = "anyharness";
+use crate::goals::{ANYHARNESS_META_KEY, GoalWire, goal_notification_update};
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
 // TODO: re-wire transient status events (0.16 port gap — the 0.11 lineage
 // emitted these and the anyharness sink still consumes them).
@@ -1063,24 +1063,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     }
 }
 
-fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
-    let status = match event.goal.status {
-        ThreadGoalStatus::Active => "active",
-        ThreadGoalStatus::Paused => "paused",
-        ThreadGoalStatus::BudgetLimited => "budget limited",
-        ThreadGoalStatus::Blocked => "blocked",
-        ThreadGoalStatus::UsageLimited => "usage limited",
-        ThreadGoalStatus::Complete => "complete",
-    };
-
-    let objective = event.goal.objective.trim();
-    if objective.contains('\n') {
-        format!("Goal updated ({status}):\n{objective}")
-    } else {
-        format!("Goal updated ({status}): {objective}")
-    }
-}
-
 // --- Hook helpers ---
 
 fn hook_tool_call_id(hook_id: &str) -> String {
@@ -1602,7 +1584,7 @@ impl PromptState {
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
-                client.send_agent_text(format_thread_goal_update(&event));
+                client.send_goal_transcript_event(&event.goal);
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -3377,6 +3359,14 @@ impl SessionClient {
         ));
     }
 
+    /// Emit the anyharness-tagged, zero-length `AgentMessageChunk` for a
+    /// native goal update (`goal_updated`, or `goal_met` when the goal
+    /// reached its terminal complete state).
+    fn send_goal_transcript_event(&self, goal: &codex_protocol::protocol::ThreadGoal) {
+        let wire = GoalWire::from_protocol(goal);
+        self.send_notification(goal_notification_update(wire.transcript_event(), Some(&wire)));
+    }
+
     // TODO: re-wire transient status events (0.16 port gap).
     #[allow(dead_code)]
     fn send_transient_status(&self, text: impl Into<String>, message_id: impl Into<String>) {
@@ -4320,8 +4310,7 @@ impl<A: Auth> ThreadActor<A> {
                 self.client.send_agent_thought(text.clone());
             }
             EventMsg::ThreadGoalUpdated(event) => {
-                self.client
-                    .send_agent_text(format_thread_goal_update(event));
+                self.client.send_goal_transcript_event(&event.goal);
             }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
@@ -5077,7 +5066,10 @@ mod tests {
         test_support::{all_model_presets, builtin_collaboration_mode_presets},
     };
     use codex_protocol::config_types::ModeKind;
-    use codex_protocol::{ThreadId, protocol::ThreadGoal};
+    use codex_protocol::{
+        ThreadId,
+        protocol::{ThreadGoal, ThreadGoalStatus, ThreadGoalUpdatedEvent},
+    };
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -5124,15 +5116,28 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(notifications.iter().any(|notification| {
-            matches!(
-                &notification.update,
+        let goal_meta = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
                 SessionUpdate::AgentMessageChunk(ContentChunk {
                     content: ContentBlock::Text(TextContent { text, .. }),
+                    meta: Some(meta),
                     ..
-                }) if text == "Goal updated (active): Ship the goal update"
-            )
-        }));
+                }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).cloned(),
+                _ => None,
+            })
+            .expect("expected an anyharness-tagged goal notification chunk");
+
+        assert_eq!(goal_meta["schemaVersion"], 1);
+        assert_eq!(goal_meta["transcriptEvent"], "goal_updated");
+        assert_eq!(goal_meta["goal"]["objective"], "Ship the goal update");
+        assert_eq!(goal_meta["goal"]["status"], "active");
+        assert_eq!(goal_meta["goal"]["nativeStatus"], "active");
+        assert_eq!(goal_meta["goal"]["tokenBudget"], 100);
+        assert_eq!(goal_meta["goal"]["tokensUsed"], 10);
+        assert_eq!(goal_meta["goal"]["timeUsedSeconds"], 2);
+        assert_eq!(goal_meta["goal"]["native"], true);
+        assert_eq!(goal_meta["goal"]["updatedAtMs"], 2000);
 
         Ok(())
     }
