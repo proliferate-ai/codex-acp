@@ -398,18 +398,18 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
 /// connection" for free because it runs a forwarding pump per thread; we
 /// have to run the same pump ourselves once we learn a child thread id
 /// exists (from `CollabAgentSpawnEnd`).
+/// Resolved child thread handle, boxed-future result of
+/// `ChildThreadResolver::resolve_child_thread`. Named to keep the trait
+/// signature readable (clippy's `type_complexity` threshold).
+type ChildThreadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>>;
+
 pub(crate) trait ChildThreadResolver: Send + Sync {
-    fn resolve_child_thread<'a>(
-        &'a self,
-        thread_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>>;
+    fn resolve_child_thread<'a>(&'a self, thread_id: &'a str) -> ChildThreadFuture<'a>;
 }
 
 impl ChildThreadResolver for ThreadManager {
-    fn resolve_child_thread<'a>(
-        &'a self,
-        thread_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>> {
+    fn resolve_child_thread<'a>(&'a self, thread_id: &'a str) -> ChildThreadFuture<'a> {
         Box::pin(async move {
             let id = codex_protocol::ThreadId::try_from(thread_id).map_err(|e| {
                 CodexErr::InvalidRequest(format!("invalid child thread id {thread_id}: {e}"))
@@ -5605,11 +5605,7 @@ mod tests {
     }
 
     impl ChildThreadResolver for StubChildThreadResolver {
-        fn resolve_child_thread<'a>(
-            &'a self,
-            thread_id: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>>
-        {
+        fn resolve_child_thread<'a>(&'a self, thread_id: &'a str) -> ChildThreadFuture<'a> {
             let found = self.children.get(thread_id).cloned();
             Box::pin(async move {
                 found
