@@ -47,7 +47,7 @@ use crate::goals::{
     AnyharnessGoalRequest, GOAL_CLEARED_EVENT, GoalSessionParams, GoalSetParams,
     GoalSetStatusParam, GoalWire, goal_notification_update, initialize_capability_meta,
 };
-use crate::thread::Thread;
+use crate::thread::{ChildThreadResolver, Thread};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -60,8 +60,10 @@ pub struct CodexAgent {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     /// The underlying codex configuration
     config: Config,
-    /// Thread manager for handling sessions
-    thread_manager: ThreadManager,
+    /// Thread manager for handling sessions. `Arc`-wrapped so a handle can
+    /// be shared into each session's `ThreadActor` as a `ChildThreadResolver`
+    /// (the activity roster's child-thread feed pump, task b).
+    thread_manager: Arc<ThreadManager>,
     /// Store for listing and updating persisted thread metadata
     thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
@@ -101,7 +103,7 @@ impl CodexAgent {
         );
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
-        let thread_manager = ThreadManager::new(
+        let thread_manager = Arc::new(ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
@@ -112,7 +114,7 @@ impl CodexAgent {
             state_db.clone(),
             installation_id,
             None,
-        );
+        ));
         Ok(Self {
             auth_manager,
             client_capabilities,
@@ -614,6 +616,7 @@ impl CodexAgent {
             self.client_capabilities.clone(),
             config.clone(),
             cx,
+            Some(self.thread_manager.clone() as Arc<dyn ChildThreadResolver>),
         ));
         let load = thread.load().await?;
 
@@ -729,6 +732,7 @@ impl CodexAgent {
             self.client_capabilities.clone(),
             config.clone(),
             cx,
+            Some(self.thread_manager.clone() as Arc<dyn ChildThreadResolver>),
         ));
 
         if replay_history {

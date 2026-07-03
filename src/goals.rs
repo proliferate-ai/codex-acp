@@ -354,4 +354,24 @@ mod tests {
             other => panic!("unexpected parse result: {other:?}"),
         }
     }
+
+    /// Task (d): codex-acp does not implement `LoopPort` -- loops are
+    /// runtime-emulated by anyharness for codex (per the pinned wire
+    /// contract's codex-acp integration addendum). Locking that the
+    /// capability stays absent (not merely `false`) so a stale membrane on
+    /// the anyharness side degrades to "unsupported" rather than seeing a
+    /// key it doesn't expect.
+    #[test]
+    fn initialize_capability_meta_advertises_goals_only_no_loops() {
+        let meta = initialize_capability_meta();
+        let anyharness = meta
+            .get(ANYHARNESS_META_KEY)
+            .expect("anyharness key present");
+        assert!(anyharness.get("goals").is_some());
+        assert!(
+            anyharness.get("loops").is_none(),
+            "codex-acp must not advertise loops support: {anyharness:?}"
+        );
+        assert_eq!(anyharness["goals"]["native"], serde_json::json!(true));
+    }
 }

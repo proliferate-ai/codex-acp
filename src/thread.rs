@@ -28,7 +28,7 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    CodexThread,
+    CodexThread, ThreadManager,
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
@@ -57,8 +57,9 @@ use codex_protocol::{
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DeprecationNoticeEvent, DynamicToolCallResponseEvent,
+        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
+        ApplyPatchApprovalRequestEvent, CollabAgentSpawnEndEvent, CollabCloseEndEvent,
+        CollabWaitingEndEvent, DeprecationNoticeEvent, DynamicToolCallResponseEvent,
         ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
         ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
         ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
@@ -148,6 +149,7 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 
 // Anyharness meta keys and event names
+use crate::activity::{self, ProcessWire, SubagentWire};
 use crate::goals::{ANYHARNESS_META_KEY, GoalWire, goal_notification_update};
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
 // TODO: re-wire transient status events (0.16 port gap — the 0.11 lineage
@@ -382,6 +384,42 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     }
 }
 
+/// Resolves a collab-spawned child thread by id so its own event stream can
+/// be pumped independently of the parent's. Abstracts over
+/// `ThreadManager::get_thread` for testability, mirroring the
+/// `CodexThreadImpl`/`ModelsManagerImpl` seams above.
+///
+/// Why this is needed at all (child-thread demux, task b): codex-acp embeds
+/// codex-core directly rather than running behind app-server. Each
+/// `Session` (parent or spawned child) owns its own independent
+/// `tx_event`/`rx_event` channel (codex-core `session/mod.rs`) -- a child's
+/// turn events never arrive on the parent's own `next_event()` stream on
+/// their own. app-server gets "child events auto-arrive on the same
+/// connection" for free because it runs a forwarding pump per thread; we
+/// have to run the same pump ourselves once we learn a child thread id
+/// exists (from `CollabAgentSpawnEnd`).
+pub(crate) trait ChildThreadResolver: Send + Sync {
+    fn resolve_child_thread<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>>;
+}
+
+impl ChildThreadResolver for ThreadManager {
+    fn resolve_child_thread<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>> {
+        Box::pin(async move {
+            let id = codex_protocol::ThreadId::try_from(thread_id).map_err(|e| {
+                CodexErr::InvalidRequest(format!("invalid child thread id {thread_id}: {e}"))
+            })?;
+            let thread = self.get_thread(id).await?;
+            Ok(thread as Arc<dyn CodexThreadImpl>)
+        })
+    }
+}
+
 pub trait Auth {
     fn logout(&self) -> impl Future<Output = Result<bool, Error>> + Send;
 }
@@ -443,6 +481,7 @@ pub struct Thread {
 }
 
 impl Thread {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -451,6 +490,7 @@ impl Thread {
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
+        child_resolver: Option<Arc<dyn ChildThreadResolver>>,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
@@ -464,6 +504,7 @@ impl Thread {
             message_rx,
             resolution_tx,
             resolution_rx,
+            child_resolver,
         );
         let handle = tokio::spawn(actor.spawn());
 
@@ -1136,6 +1177,12 @@ struct ActiveCommand {
     terminal_output: bool,
     output: String,
     file_extension: Option<String>,
+    /// Identity fields for the `process_upserted` roster (task c), echoed
+    /// back unchanged on the terminal `exited` upsert so it's a
+    /// self-contained snapshot rather than a bare status flip.
+    command: String,
+    cwd: Option<String>,
+    started_at_ms: i64,
 }
 
 struct PromptState {
@@ -1210,6 +1257,30 @@ impl PromptState {
         // Keep detached permission request tasks running so ACP can route the
         // client's required `Cancelled` response after session cancellation.
         self.pending_permission_interactions.clear();
+    }
+
+    /// Task (c): force-exit ("expire") any command still tracked as
+    /// `Running` when the turn ends. Codex's `commandExecution` items are
+    /// strictly in-turn -- an `ExecCommandEnd` should always precede
+    /// `TurnComplete`/`TurnAborted` -- but this is a defensive drain for the
+    /// abort/error paths where that pairing isn't guaranteed, so the
+    /// roster never carries a `running` row past the turn that started it.
+    /// The exit code is unknown in that case (`None`), distinct from a
+    /// normal exit's `Some(code)`.
+    fn expire_active_processes(&mut self, client: &SessionClient) {
+        let ended_at_ms = now_ms();
+        for (call_id, active_command) in self.active_commands.drain() {
+            client.send_notification(activity::process_notification_update(
+                &ProcessWire::exited(
+                    call_id,
+                    active_command.command,
+                    active_command.cwd,
+                    Some(active_command.started_at_ms),
+                    ended_at_ms,
+                    None,
+                ),
+            ));
+        }
     }
 
     fn spawn_permission_request(
@@ -1680,6 +1751,12 @@ impl PromptState {
                 );
                 self.transient_status_message_id = None;
                 self.detach_pending_interactions();
+                // Task (c): commandExecution items are strictly in-turn
+                // (harness-runtime-mechanics.md §4.2 -- nothing runs
+                // between turns), so anything still `Running` here is a
+                // leftover that must be expired now rather than surviving
+                // as a stale roster row past turn end.
+                self.expire_active_processes(client);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -1699,6 +1776,7 @@ impl PromptState {
             }) => {
                 error!("Unhandled error during turn: {message} {codex_error_info:?}");
                 self.detach_pending_interactions();
+                self.expire_active_processes(client);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx
                         .send(Err(Error::internal_error().data(
@@ -1711,6 +1789,7 @@ impl PromptState {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.transient_status_message_id = None;
                 self.detach_pending_interactions();
+                self.expire_active_processes(client);
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::Cancelled)).ok();
                 }
@@ -2431,7 +2510,7 @@ impl PromptState {
         let raw_input = serde_json::json!(&event);
         let ExecApprovalRequestEvent {
             call_id,
-            command: _,
+            command,
             turn_id,
             cwd,
             reason,
@@ -2442,6 +2521,7 @@ impl PromptState {
             additional_permissions,
             available_decisions: _,
             proposed_network_policy_amendments,
+            started_at_ms,
             ..
         } = event;
 
@@ -2461,6 +2541,9 @@ impl PromptState {
                 tool_call_id: tool_call_id.clone(),
                 output: String::new(),
                 file_extension,
+                command: command.join(" "),
+                cwd: Some(cwd.display().to_string()),
+                started_at_ms,
             },
         );
 
@@ -2551,8 +2634,8 @@ impl PromptState {
             source: _,
             interaction_input: _,
             call_id,
-            command: _,
-            started_at_ms: _,
+            command,
+            started_at_ms,
             cwd,
             parsed_cmd,
             process_id: _,
@@ -2567,11 +2650,17 @@ impl PromptState {
             kind,
         } = parse_command_tool_call(parsed_cmd, &cwd);
 
+        let command_str = command.join(" ");
+        let cwd_str = cwd.display().to_string();
+
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
             output: String::new(),
             file_extension,
             terminal_output,
+            command: command_str.clone(),
+            cwd: Some(cwd_str.clone()),
+            started_at_ms,
         };
         let (content, meta) = if client.supports_terminal_output(&active_command) {
             let content = vec![ToolCallContent::Terminal(Terminal::new(call_id.clone()))];
@@ -2588,6 +2677,11 @@ impl PromptState {
         };
 
         self.active_commands.insert(call_id.clone(), active_command);
+
+        // Task (c): process_upserted, Running at item/started.
+        client.send_notification(activity::process_notification_update(
+            &ProcessWire::running(call_id, command_str, Some(cwd_str), started_at_ms),
+        ));
 
         client.send_tool_call(
             ToolCall::new(tool_call_id, title)
@@ -2654,10 +2748,22 @@ impl PromptState {
             duration: _,
             formatted_output: _,
             process_id: _,
-            completed_at_ms: _,
+            completed_at_ms,
             status,
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
+            // Task (c): process_upserted, Exited at item/completed.
+            client.send_notification(activity::process_notification_update(
+                &ProcessWire::exited(
+                    call_id.clone(),
+                    active_command.command.clone(),
+                    active_command.cwd.clone(),
+                    Some(active_command.started_at_ms),
+                    completed_at_ms,
+                    Some(exit_code),
+                ),
+            ));
+
             let is_success = exit_code == 0;
 
             let status = match status {
@@ -3431,6 +3537,41 @@ struct ThreadActor<A> {
     resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     /// Last config options state we emitted to the client, used for deduping updates.
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
+    /// Resolves collab child thread handles for the activity feed pump
+    /// (task b). `None` in tests/environments with no `ThreadManager`
+    /// available -- the roster's `subagent_upserted` lifecycle (task a)
+    /// still emits either way; only the child's own live feed bytes are
+    /// gated on this.
+    child_resolver: Option<Arc<dyn ChildThreadResolver>>,
+    /// Child thread ids currently being pumped, so a duplicate
+    /// `CollabAgentSpawnEnd` (should not normally happen, but the wire
+    /// makes no uniqueness promise) never starts a second pump for the
+    /// same feed.
+    child_feed_pumps: HashSet<String>,
+    /// Best-effort snapshot of spawn-time identity (model/prompt/role) per
+    /// child thread id, consulted so `CollabWaitingEnd`/`CollabCloseEnd`
+    /// upserts -- which carry none of that themselves -- still emit a
+    /// fully-populated `SubagentWire` rather than nulling out fields the
+    /// roster already knew. Session-scoped (survives across turns), unlike
+    /// `PromptState::active_commands`, because collab wait/close can land
+    /// in a later turn than the spawn.
+    spawned_agents: HashMap<String, SpawnedAgentSnapshot>,
+}
+
+/// Spawn-time identity captured from `CollabAgentSpawnEnd`, the only collab
+/// event that carries model/prompt/role. See `ThreadActor::spawned_agents`.
+#[derive(Clone, Debug, Default)]
+struct SpawnedAgentSnapshot {
+    model: Option<String>,
+    description: Option<String>,
+    agent_type: Option<String>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -3444,6 +3585,7 @@ impl<A: Auth> ThreadActor<A> {
         message_rx: mpsc::UnboundedReceiver<ThreadMessage>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
+        child_resolver: Option<Arc<dyn ChildThreadResolver>>,
     ) -> Self {
         Self {
             auth,
@@ -3456,6 +3598,9 @@ impl<A: Auth> ThreadActor<A> {
             message_rx,
             resolution_rx,
             last_sent_config_options: None,
+            child_resolver,
+            child_feed_pumps: HashSet::new(),
+            spawned_agents: HashMap::new(),
         }
     }
 
@@ -4357,6 +4502,21 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        // Task (a): subagent roster from the collabAgentToolCall lifecycle.
+        // These events arrive on the *parent's* own submission (the spawn/
+        // wait/close tool calls run inside the parent's turn -- see
+        // codex-core's `session.send_event(&turn, ...)` call sites), so
+        // this peek runs before dispatch either finds an existing
+        // submission or falls through to the goal-continuation path below;
+        // either way the event is still forwarded to `PromptState` afterward
+        // unchanged (it remains a documented no-op there).
+        match &msg {
+            EventMsg::CollabAgentSpawnEnd(event) => self.collab_agent_spawn_end(event),
+            EventMsg::CollabWaitingEnd(event) => self.collab_agent_waiting_end(event),
+            EventMsg::CollabCloseEnd(event) => self.collab_agent_close_end(event),
+            _ => {}
+        }
+
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
             return;
@@ -4399,6 +4559,148 @@ impl<A: Auth> ThreadActor<A> {
             response_tx,
         ));
         self.submissions.entry(submission_id).or_insert(state)
+    }
+
+    /// `CollabAgentSpawnEnd`: task (a) roster + task (b) feed pump kickoff.
+    /// Emits `subagent_upserted` (status `running`) for a successful spawn
+    /// and starts the child's own event-stream pump so its live feed
+    /// becomes available. A failed spawn (no `new_thread_id`, or an
+    /// errored/not-found status) has no id to roster and is skipped.
+    fn collab_agent_spawn_end(&mut self, event: &CollabAgentSpawnEndEvent) {
+        let Some(new_thread_id) = event.new_thread_id else {
+            return;
+        };
+        if matches!(
+            event.status,
+            AgentStatus::Errored(_) | AgentStatus::NotFound
+        ) {
+            return;
+        }
+        let thread_id = new_thread_id.to_string();
+        let snapshot = SpawnedAgentSnapshot {
+            model: (!event.model.is_empty()).then(|| event.model.clone()),
+            description: activity::truncate_description(&event.prompt),
+            agent_type: event
+                .new_agent_role
+                .clone()
+                .or_else(|| event.new_agent_nickname.clone()),
+        };
+        self.spawned_agents
+            .insert(thread_id.clone(), snapshot.clone());
+
+        let wire = SubagentWire {
+            id: thread_id.clone(),
+            agent_type: snapshot.agent_type,
+            description: snapshot.description,
+            model: snapshot.model,
+            background: false,
+            status: activity::SUBAGENT_STATUS_RUNNING,
+            summary: None,
+            feed_transport: activity::child_feed_transport(&thread_id),
+            native: true,
+            updated_at_ms: now_ms(),
+        };
+        self.client
+            .send_notification(activity::subagent_notification_update(&wire));
+
+        self.start_child_feed_pump(thread_id);
+    }
+
+    /// `CollabWaitingEnd`: task (a) roster. Emits one `subagent_upserted`
+    /// per watched agent using its reported status. "wait-completed
+    /// agentsStates -> Completed with message summary" is the common case,
+    /// but a wait can also end with an agent still `Running`/`Interrupted`
+    /// (budget/interrupt) -- that's mirrored faithfully via
+    /// `activity::map_agent_status` rather than force-reported as complete.
+    fn collab_agent_waiting_end(&mut self, event: &CollabWaitingEndEvent) {
+        if event.agent_statuses.is_empty() {
+            for (thread_id, status) in &event.statuses {
+                self.emit_subagent_status(&thread_id.to_string(), status);
+            }
+        } else {
+            for entry in &event.agent_statuses {
+                self.emit_subagent_status(&entry.thread_id.to_string(), &entry.status);
+            }
+        }
+    }
+
+    /// `CollabCloseEnd`: task (a) roster terminal. An explicit close always
+    /// finalizes that child's roster entry (see `activity::map_agent_status`
+    /// for why `Shutdown` here maps to `completed`, not `failed`), and its
+    /// spawn-time snapshot is no longer needed afterward.
+    fn collab_agent_close_end(&mut self, event: &CollabCloseEndEvent) {
+        let thread_id = event.receiver_thread_id.to_string();
+        self.emit_subagent_status(&thread_id, &event.status);
+        self.spawned_agents.remove(&thread_id);
+    }
+
+    /// Shared tail for waiting/close: map the native status, backfill
+    /// identity fields from the spawn-time snapshot (wait/close events
+    /// don't carry model/prompt/role themselves), and emit.
+    fn emit_subagent_status(&self, thread_id: &str, status: &AgentStatus) {
+        let (status, summary) = activity::map_agent_status(status);
+        let snapshot = self.spawned_agents.get(thread_id).cloned().unwrap_or_default();
+        let wire = SubagentWire {
+            id: thread_id.to_string(),
+            agent_type: snapshot.agent_type,
+            description: snapshot.description,
+            model: snapshot.model,
+            background: false,
+            status,
+            summary,
+            feed_transport: activity::child_feed_transport(thread_id),
+            native: true,
+            updated_at_ms: now_ms(),
+        };
+        self.client
+            .send_notification(activity::subagent_notification_update(&wire));
+    }
+
+    /// Task (b): spins up a background pump reading the child thread's own
+    /// `next_event()` stream, re-emitting each event as a feed-scoped
+    /// `acp_child_demux` tagged chunk. This never goes through the normal
+    /// per-type `PromptState::handle_event` dispatch, so nothing from a
+    /// child thread can leak into the parent's visible transcript -- see
+    /// the `ChildThreadResolver` doc comment for why this pump is needed at
+    /// all. Exits on the child's own `ShutdownComplete` or when its event
+    /// stream errors (thread torn down); a `closeAgent` call normally
+    /// produces both in short order, so no separate cancellation signal is
+    /// wired up here -- see integrationNotes for the tradeoff.
+    fn start_child_feed_pump(&mut self, thread_id: String) {
+        let Some(resolver) = self.child_resolver.clone() else {
+            return;
+        };
+        if !self.child_feed_pumps.insert(thread_id.clone()) {
+            return;
+        }
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let child_thread = match resolver.resolve_child_thread(&thread_id).await {
+                Ok(thread) => thread,
+                Err(err) => {
+                    warn!("activity feed: failed to resolve child thread {thread_id}: {err:?}");
+                    return;
+                }
+            };
+            loop {
+                match child_thread.next_event().await {
+                    Ok(Event { msg, .. }) => {
+                        let is_shutdown = matches!(msg, EventMsg::ShutdownComplete);
+                        client
+                            .send_notification(activity::child_feed_event_update(&thread_id, &msg));
+                        if is_shutdown {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        info!(
+                            "activity feed: child thread {thread_id} event stream ended: {err:?}"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -4950,6 +5252,476 @@ mod tests {
         assert_eq!(goal_meta["goal"]["nativeStatus"], "complete");
         assert_eq!(goal_meta["goal"]["tokensUsed"], 90);
 
+        Ok(())
+    }
+
+    /// Poll `client.notifications` for the first anyharness-tagged chunk
+    /// whose `transcriptEvent` matches, mirroring the polling pattern
+    /// `test_thread_goal_updated_without_submission_is_forwarded` uses for
+    /// events that arrive asynchronously (off a background actor task
+    /// rather than a synchronously-awaited `session/prompt` call).
+    async fn wait_for_meta(client: &StubClient, transcript_event: &str) -> serde_json::Value {
+        wait_for_meta_matching(client, transcript_event, |_| true).await
+    }
+
+    /// Like `wait_for_meta`, but returns the *last* (most recent) matching
+    /// chunk satisfying `predicate` over the anyharness `_meta` payload --
+    /// needed when a roster id gets more than one `_upserted` chunk
+    /// (e.g. running then exited/completed) and the test cares about a
+    /// specific one, not just "any".
+    async fn wait_for_meta_matching(
+        client: &StubClient,
+        transcript_event: &str,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let notifications = client.notifications.lock().unwrap();
+                    let found = notifications.iter().rev().find_map(|notification| {
+                        match &notification.update {
+                            SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(TextContent { text, .. }),
+                                meta: Some(meta),
+                                ..
+                            }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).and_then(|m| {
+                                (m.get("transcriptEvent")?.as_str()? == transcript_event
+                                    && predicate(m))
+                                .then(|| m.clone())
+                            }),
+                            _ => None,
+                        }
+                    });
+                    if let Some(meta) = found {
+                        break meta;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected a {transcript_event} notification matching predicate"))
+    }
+
+    // --- Task (a): collabAgentToolCall lifecycle -> subagent roster ---
+
+    #[tokio::test]
+    async fn test_collab_agent_spawn_end_emits_running_subagent_upsert() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+        let child_thread_id = ThreadId::default();
+
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-1".to_string(),
+                completed_at_ms: 1_000,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: Some(child_thread_id),
+                new_agent_nickname: None,
+                new_agent_role: Some("reviewer".to_string()),
+                prompt: "review the diff".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        })?;
+
+        let meta = wait_for_meta(&client, activity::SUBAGENT_UPSERTED_EVENT).await;
+        drop(message_tx);
+
+        assert_eq!(meta["subagent"]["id"], child_thread_id.to_string());
+        assert_eq!(meta["subagent"]["status"], "running");
+        assert_eq!(meta["subagent"]["model"], "gpt-5.5");
+        assert_eq!(meta["subagent"]["agentType"], "reviewer");
+        assert_eq!(meta["subagent"]["description"], "review the diff");
+        assert_eq!(meta["subagent"]["background"], false);
+        assert_eq!(meta["subagent"]["summary"], serde_json::Value::Null);
+        assert_eq!(
+            meta["subagent"]["feedTransport"],
+            format!("acp_child_demux:{child_thread_id}")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_agent_spawn_end_skips_roster_when_spawn_failed() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+
+        // No `new_thread_id` -- the spawn never produced a thread to roster.
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-1".to_string(),
+                completed_at_ms: 1_000,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: None,
+                new_agent_nickname: None,
+                new_agent_role: None,
+                prompt: "review the diff".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::NotFound,
+            }),
+        })?;
+        // Follow it with an event we know arrives, so the absence of a
+        // subagent_upserted chunk isn't just "we didn't wait long enough".
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "spawn-turn".to_string(),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(message_tx);
+
+        let leaked = client.notifications.lock().unwrap().iter().any(|n| {
+            matches!(&n.update, SessionUpdate::AgentMessageChunk(ContentChunk { meta: Some(meta), .. })
+                if meta.get(ANYHARNESS_META_KEY)
+                    .and_then(|m| m.get("transcriptEvent"))
+                    .and_then(|v| v.as_str())
+                    == Some(activity::SUBAGENT_UPSERTED_EVENT))
+        });
+        assert!(!leaked, "a failed spawn (no thread id) must not roster anything");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_agent_waiting_end_backfills_identity_and_carries_summary()
+    -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+        let child_thread_id = ThreadId::default();
+
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-1".to_string(),
+                completed_at_ms: 1_000,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: Some(child_thread_id),
+                new_agent_nickname: None,
+                new_agent_role: Some("reviewer".to_string()),
+                prompt: "review the diff".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        })?;
+        wait_for_meta(&client, activity::SUBAGENT_UPSERTED_EVENT).await;
+
+        // CollabWaitingEnd carries no model/prompt/role itself -- the
+        // upsert must still be fully populated from the spawn-time
+        // snapshot, not null those fields out.
+        conversation.op_tx.send(Event {
+            id: "wait-turn".to_string(),
+            msg: EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                sender_thread_id: ThreadId::default(),
+                call_id: "call-2".to_string(),
+                completed_at_ms: 2_000,
+                agent_statuses: Vec::new(),
+                statuses: [(
+                    child_thread_id,
+                    AgentStatus::Completed(Some("looks good".to_string())),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+        })?;
+
+        let meta = wait_for_meta_matching(&client, activity::SUBAGENT_UPSERTED_EVENT, |m| {
+            m["subagent"]["status"] == "completed"
+        })
+        .await;
+        drop(message_tx);
+
+        assert_eq!(meta["subagent"]["id"], child_thread_id.to_string());
+        assert_eq!(meta["subagent"]["status"], "completed");
+        assert_eq!(meta["subagent"]["summary"], "looks good");
+        assert_eq!(meta["subagent"]["model"], "gpt-5.5");
+        assert_eq!(meta["subagent"]["agentType"], "reviewer");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collab_agent_close_end_shutdown_maps_to_completed_not_failed() -> anyhow::Result<()>
+    {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+        let child_thread_id = ThreadId::default();
+
+        conversation.op_tx.send(Event {
+            id: "close-turn".to_string(),
+            msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                call_id: "call-3".to_string(),
+                completed_at_ms: 3_000,
+                sender_thread_id: ThreadId::default(),
+                receiver_thread_id: child_thread_id,
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
+                status: AgentStatus::Shutdown,
+            }),
+        })?;
+
+        let meta = wait_for_meta(&client, activity::SUBAGENT_UPSERTED_EVENT).await;
+        drop(message_tx);
+
+        assert_eq!(meta["subagent"]["id"], child_thread_id.to_string());
+        // An explicit closeAgent terminal is a normal completion, not a
+        // failure -- see `activity::map_agent_status`.
+        assert_eq!(meta["subagent"]["status"], "completed");
+
+        Ok(())
+    }
+
+    // --- Task (c): commandExecution item lifecycle -> process roster ---
+
+    fn exec_command_begin_event(call_id: &str, started_at_ms: i64, cwd: PathBuf) -> EventMsg {
+        EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            call_id: call_id.to_string(),
+            process_id: None,
+            turn_id: "exec-turn".to_string(),
+            started_at_ms,
+            command: vec!["echo".to_string(), "hi".to_string()],
+            cwd: cwd.try_into().unwrap(),
+            parsed_cmd: vec![ParsedCommand::Unknown {
+                cmd: "echo hi".to_string(),
+            }],
+            source: Default::default(),
+            interaction_input: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_process_upserted_running_then_exited_lifecycle() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+        let cwd = std::env::current_dir().unwrap();
+
+        conversation.op_tx.send(Event {
+            id: "exec-turn".to_string(),
+            msg: exec_command_begin_event("cmd-1", 1_000, cwd.clone()),
+        })?;
+
+        let running = wait_for_meta_matching(&client, activity::PROCESS_UPSERTED_EVENT, |m| {
+            m["process"]["status"] == "running"
+        })
+        .await;
+        assert_eq!(running["process"]["id"], "cmd-1");
+        assert_eq!(running["process"]["command"], "echo hi");
+        assert_eq!(running["process"]["startedAtMs"], 1000);
+        assert_eq!(running["process"]["exitCode"], serde_json::Value::Null);
+
+        conversation.op_tx.send(Event {
+            id: "exec-turn".to_string(),
+            msg: EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                call_id: "cmd-1".to_string(),
+                process_id: None,
+                turn_id: "exec-turn".to_string(),
+                completed_at_ms: 2_000,
+                command: vec!["echo".to_string(), "hi".to_string()],
+                cwd: cwd.try_into().unwrap(),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "echo hi".to_string(),
+                }],
+                source: Default::default(),
+                interaction_input: None,
+                stdout: "hi\n".to_string(),
+                stderr: String::new(),
+                aggregated_output: "hi\n".to_string(),
+                exit_code: 0,
+                duration: Duration::from_millis(5),
+                formatted_output: "hi\n".to_string(),
+                status: ExecCommandStatus::Completed,
+            }),
+        })?;
+
+        let exited = wait_for_meta_matching(&client, activity::PROCESS_UPSERTED_EVENT, |m| {
+            m["process"]["status"] == "exited"
+        })
+        .await;
+        drop(message_tx);
+
+        assert_eq!(exited["process"]["id"], "cmd-1");
+        assert_eq!(exited["process"]["command"], "echo hi");
+        assert_eq!(exited["process"]["startedAtMs"], 1000);
+        assert_eq!(exited["process"]["endedAtMs"], 2000);
+        assert_eq!(exited["process"]["exitCode"], 0);
+
+        Ok(())
+    }
+
+    /// Task (c)'s "emit removal/expiry at turn end": a command that's still
+    /// `Running` when `TurnComplete` fires (no `ExecCommandEnd` arrived --
+    /// shouldn't happen per harness-runtime-mechanics.md §4.2, but this is
+    /// exactly the defensive path `expire_active_processes` exists for)
+    /// must still flip to `exited` with a null exit code, rather than
+    /// leaving a stale `running` roster row behind after its turn ended.
+    #[tokio::test]
+    async fn test_process_upserted_expires_at_turn_end_when_never_exited() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+        let cwd = std::env::current_dir().unwrap();
+
+        conversation.op_tx.send(Event {
+            id: "exec-turn".to_string(),
+            msg: exec_command_begin_event("cmd-2", 1_000, cwd),
+        })?;
+        wait_for_meta_matching(&client, activity::PROCESS_UPSERTED_EVENT, |m| {
+            m["process"]["status"] == "running"
+        })
+        .await;
+
+        conversation.op_tx.send(Event {
+            id: "exec-turn".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "exec-turn".to_string(),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        let expired = wait_for_meta_matching(&client, activity::PROCESS_UPSERTED_EVENT, |m| {
+            m["process"]["status"] == "exited"
+        })
+        .await;
+        drop(message_tx);
+
+        assert_eq!(expired["process"]["id"], "cmd-2");
+        // Never received an ExecCommandEnd -- exit code is unknown.
+        assert_eq!(expired["process"]["exitCode"], serde_json::Value::Null);
+        assert_eq!(expired["process"]["startedAtMs"], 1000);
+
+        Ok(())
+    }
+
+    struct StubChildThreadResolver {
+        children: HashMap<String, Arc<StubCodexThread>>,
+    }
+
+    impl ChildThreadResolver for StubChildThreadResolver {
+        fn resolve_child_thread<'a>(
+            &'a self,
+            thread_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn CodexThreadImpl>, CodexErr>> + Send + 'a>>
+        {
+            let found = self.children.get(thread_id).cloned();
+            Box::pin(async move {
+                found
+                    .map(|thread| thread as Arc<dyn CodexThreadImpl>)
+                    .ok_or(CodexErr::InternalAgentDied)
+            })
+        }
+    }
+
+    // --- Task (b): child-thread demux ---
+
+    /// End-to-end: a successful spawn starts the child feed pump
+    /// (`ChildThreadResolver`), and the child thread's own raw event
+    /// stream is re-emitted as `acp_child_demux` tagged chunks on the
+    /// parent's connection -- never as a normal, visible transcript chunk.
+    #[tokio::test]
+    async fn test_child_feed_pump_demuxes_child_events_without_leaking_to_transcript()
+    -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let child_conversation = Arc::new(StubCodexThread::new());
+        let child_thread_id = ThreadId::default();
+        let resolver: Arc<dyn ChildThreadResolver> = Arc::new(StubChildThreadResolver {
+            children: [(child_thread_id.to_string(), child_conversation.clone())]
+                .into_iter()
+                .collect(),
+        });
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+            Some(resolver),
+        );
+        let _handle = tokio::spawn(actor.spawn());
+
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-1".to_string(),
+                completed_at_ms: 1_000,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: Some(child_thread_id),
+                new_agent_nickname: None,
+                new_agent_role: Some("reviewer".to_string()),
+                prompt: "review the diff".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        })?;
+        let subagent_meta = wait_for_meta(&client, activity::SUBAGENT_UPSERTED_EVENT).await;
+        assert_eq!(
+            subagent_meta["subagent"]["feedTransport"],
+            format!("acp_child_demux:{child_thread_id}")
+        );
+
+        // The child's own event stream -- routed through a completely
+        // separate `next_event()` (see `ChildThreadResolver`'s doc comment
+        // for why codex-acp has to pump this itself).
+        child_conversation.op_tx.send(Event {
+            id: "child-turn".to_string(),
+            msg: EventMsg::AgentMessage(AgentMessageEvent {
+                message: "child says hi".to_string(),
+                phase: None,
+                memory_citation: None,
+            }),
+        })?;
+
+        let demux_meta = wait_for_meta(&client, activity::CHILD_DEMUX_EVENT).await;
+        assert_eq!(demux_meta["threadId"], child_thread_id.to_string());
+        assert_eq!(
+            demux_meta["feedTransport"],
+            format!("acp_child_demux:{child_thread_id}")
+        );
+        assert_eq!(demux_meta["event"]["type"], "agent_message");
+        assert_eq!(demux_meta["event"]["message"], "child says hi");
+
+        // The child's text must never appear as a normal, visible
+        // AgentMessageChunk -- only inside the `acp_child_demux` envelope's
+        // `_meta`, so a membrane unaware of that tag renders nothing rather
+        // than leaking child transcript into the parent's.
+        let leaked = client.notifications.lock().unwrap().iter().any(|n| {
+            matches!(
+                &n.update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "child says hi"
+            )
+        });
+        assert!(
+            !leaked,
+            "child transcript text must not leak onto the parent's visible transcript"
+        );
+
+        drop(message_tx);
         Ok(())
     }
 
@@ -5554,6 +6326,7 @@ mod tests {
             message_rx,
             resolution_tx,
             resolution_rx,
+            None,
         );
 
         let handle = tokio::spawn(actor.spawn());
@@ -6545,6 +7318,7 @@ mod tests {
             message_rx,
             resolution_tx,
             resolution_rx,
+            None,
         );
 
         let handle = tokio::spawn(actor.spawn());
