@@ -3543,11 +3543,15 @@ struct ThreadActor<A> {
     /// still emits either way; only the child's own live feed bytes are
     /// gated on this.
     child_resolver: Option<Arc<dyn ChildThreadResolver>>,
-    /// Child thread ids currently being pumped, so a duplicate
-    /// `CollabAgentSpawnEnd` (should not normally happen, but the wire
-    /// makes no uniqueness promise) never starts a second pump for the
-    /// same feed.
-    child_feed_pumps: HashSet<String>,
+    /// `JoinHandle` for each child thread's live feed pump, keyed by child
+    /// thread id, so a duplicate `CollabAgentSpawnEnd` (should not normally
+    /// happen, but the wire makes no uniqueness promise) never starts a
+    /// second pump for the same feed. Aborted in bulk when `spawn()`'s
+    /// actor loop terminates (see the `abort_child_feed_pumps` call at the
+    /// end of `spawn()`) so a pump blocked on a resumable child thread's
+    /// `next_event()` can never outlive its parent session -- see
+    /// `start_child_feed_pump`'s doc comment.
+    child_feed_pump_handles: HashMap<String, tokio::task::JoinHandle<()>>,
     /// Best-effort snapshot of spawn-time identity (model/prompt/role) per
     /// child thread id, consulted so `CollabWaitingEnd`/`CollabCloseEnd`
     /// upserts -- which carry none of that themselves -- still emit a
@@ -3599,7 +3603,7 @@ impl<A: Auth> ThreadActor<A> {
             resolution_rx,
             last_sent_config_options: None,
             child_resolver,
-            child_feed_pumps: HashSet::new(),
+            child_feed_pump_handles: HashMap::new(),
             spawned_agents: HashMap::new(),
         }
     }
@@ -3631,6 +3635,23 @@ impl<A: Auth> ThreadActor<A> {
             if !message_rx_open && self.submissions.is_empty() {
                 break;
             }
+        }
+        // Neither `break` above tears down the detached child feed pumps on
+        // its own (they run in their own `tokio::spawn`ed tasks, reading a
+        // resumable child thread's own `next_event()`, which does not error
+        // just because the parent's stream did) -- abort them explicitly so
+        // none outlives this actor. See `start_child_feed_pump`'s doc
+        // comment.
+        self.abort_child_feed_pumps();
+    }
+
+    /// Aborts and drops every still-tracked child feed pump `JoinHandle`.
+    /// Called once, when `spawn()`'s actor loop terminates -- see the call
+    /// site's comment for why this can't just rely on the pumps noticing
+    /// their parent is gone on their own.
+    fn abort_child_feed_pumps(&mut self) {
+        for handle in self.child_feed_pump_handles.drain().map(|(_, handle)| handle) {
+            handle.abort();
         }
     }
 
@@ -4664,21 +4685,31 @@ impl<A: Auth> ThreadActor<A> {
     /// the `ChildThreadResolver` doc comment for why this pump is needed at
     /// all. Exits on the child's own `ShutdownComplete` or when its event
     /// stream errors (thread torn down); a `closeAgent` call normally
-    /// produces both in short order, so no separate cancellation signal is
-    /// wired up here -- see integrationNotes for the tradeoff.
+    /// produces both in short order. There is still no *separate*
+    /// cancellation signal wired into the pump's own loop body -- but its
+    /// `JoinHandle` is tracked in `child_feed_pump_handles` and aborted in
+    /// bulk by `abort_child_feed_pumps` when the parent actor tears down,
+    /// so a child thread that never emits `ShutdownComplete` on parent
+    /// teardown (codex child threads are resumable, per
+    /// harness-runtime-mechanics.md -- they don't necessarily shut down
+    /// just because the parent did) can no longer pin this task, and the
+    /// `Arc<dyn CodexThreadImpl>` it holds, alive forever.
     fn start_child_feed_pump(&mut self, thread_id: String) {
         let Some(resolver) = self.child_resolver.clone() else {
             return;
         };
-        if !self.child_feed_pumps.insert(thread_id.clone()) {
+        if self.child_feed_pump_handles.contains_key(&thread_id) {
             return;
         }
         let client = self.client.clone();
-        tokio::spawn(async move {
-            let child_thread = match resolver.resolve_child_thread(&thread_id).await {
+        let pump_thread_id = thread_id.clone();
+        let handle = tokio::spawn(async move {
+            let child_thread = match resolver.resolve_child_thread(&pump_thread_id).await {
                 Ok(thread) => thread,
                 Err(err) => {
-                    warn!("activity feed: failed to resolve child thread {thread_id}: {err:?}");
+                    warn!(
+                        "activity feed: failed to resolve child thread {pump_thread_id}: {err:?}"
+                    );
                     return;
                 }
             };
@@ -4686,21 +4717,24 @@ impl<A: Auth> ThreadActor<A> {
                 match child_thread.next_event().await {
                     Ok(Event { msg, .. }) => {
                         let is_shutdown = matches!(msg, EventMsg::ShutdownComplete);
-                        client
-                            .send_notification(activity::child_feed_event_update(&thread_id, &msg));
+                        client.send_notification(activity::child_feed_event_update(
+                            &pump_thread_id,
+                            &msg,
+                        ));
                         if is_shutdown {
                             break;
                         }
                     }
                     Err(err) => {
                         info!(
-                            "activity feed: child thread {thread_id} event stream ended: {err:?}"
+                            "activity feed: child thread {pump_thread_id} event stream ended: {err:?}"
                         );
                         break;
                     }
                 }
             }
         });
+        self.child_feed_pump_handles.insert(thread_id, handle);
     }
 }
 
@@ -5718,6 +5752,152 @@ mod tests {
         );
 
         drop(message_tx);
+        Ok(())
+    }
+
+    /// Like `StubChildThreadResolver`, but `.take()`s its one child out of a
+    /// `Mutex` on resolution instead of `.clone()`-ing it out of a `HashMap`
+    /// it keeps holding forever. Used where a test needs to reason exactly
+    /// about how many strong references to the resolved child thread exist
+    /// afterward -- with the plain `HashMap`-backed resolver, the map's own
+    /// held clone would be an extra, resolver-lifetime-dependent reference
+    /// that has nothing to do with the pump task itself.
+    struct SingleUseChildThreadResolver {
+        thread_id: String,
+        child: std::sync::Mutex<Option<Arc<StubCodexThread>>>,
+    }
+
+    impl ChildThreadResolver for SingleUseChildThreadResolver {
+        fn resolve_child_thread<'a>(&'a self, thread_id: &'a str) -> ChildThreadFuture<'a> {
+            let found = if thread_id == self.thread_id {
+                self.child.lock().unwrap().take()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                found
+                    .map(|thread| thread as Arc<dyn CodexThreadImpl>)
+                    .ok_or(CodexErr::InternalAgentDied)
+            })
+        }
+    }
+
+    /// The pump's `next_event()` loop only exits on the child's own
+    /// `ShutdownComplete` or a stream error -- neither of which a
+    /// resumable-but-quiescent child thread necessarily ever produces just
+    /// because the *parent* actor is tearing down. Without tracking and
+    /// aborting the pump's `JoinHandle`, it (and the `Arc<dyn
+    /// CodexThreadImpl>` clone of the child thread it holds) leaks forever.
+    /// Proven here via strong-count: the pump's resolved `child_thread`
+    /// binding is the *only* extra strong reference to the stub beyond this
+    /// test's own, so it must drop back to 1 once the parent actor tears
+    /// down -- it won't if the pump task is still alive.
+    #[tokio::test]
+    async fn test_child_feed_pump_is_aborted_when_parent_actor_tears_down() -> anyhow::Result<()> {
+        let session_id = SessionId::new("test");
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
+        let conversation = Arc::new(StubCodexThread::new());
+        let child_conversation = Arc::new(StubCodexThread::new());
+        let child_thread_id = ThreadId::default();
+        let resolver: Arc<dyn ChildThreadResolver> = Arc::new(SingleUseChildThreadResolver {
+            thread_id: child_thread_id.to_string(),
+            child: std::sync::Mutex::new(Some(child_conversation.clone())),
+        });
+        let models_manager = Arc::new(StubModelsManager);
+        let config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
+        let actor = ThreadActor::new(
+            StubAuth,
+            session_client,
+            conversation.clone(),
+            models_manager,
+            config,
+            message_rx,
+            resolution_tx,
+            resolution_rx,
+            Some(resolver),
+        );
+        let handle = tokio::spawn(actor.spawn());
+
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-1".to_string(),
+                completed_at_ms: 1_000,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: Some(child_thread_id),
+                new_agent_nickname: None,
+                new_agent_role: Some("reviewer".to_string()),
+                prompt: "review the diff".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        })?;
+        // Wait for the roster upsert -- it is only emitted after
+        // `start_child_feed_pump` is called, and the pump resolves the
+        // child thread (taking its own strong clone, the only remaining
+        // reference once `SingleUseChildThreadResolver` gives up its own)
+        // before its `next_event()` loop starts. `child_conversation`'s own
+        // `op_tx` sender is never dropped and never sent a
+        // `ShutdownComplete`, so absent a fix the pump blocks on
+        // `next_event()` forever.
+        wait_for_meta(&client, activity::SUBAGENT_UPSERTED_EVENT).await;
+
+        let resolved_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while Arc::strong_count(&child_conversation) < 2 && tokio::time::Instant::now() < resolved_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&child_conversation),
+            2,
+            "pump should hold its own resolved clone of the child thread while running"
+        );
+
+        // Complete the parent's own turn ("spawn-turn") first: `handle_event`
+        // lazily registers a synthetic engine-initiated submission for any
+        // event id it has not seen before (see
+        // `register_engine_initiated_submission`), and `spawn()`'s teardown
+        // gate (`!message_rx_open && self.submissions.is_empty()`) waits for
+        // every in-flight submission to finish, by design, so it can drain a
+        // real turn before exiting -- it never will on its own here unless
+        // this turn is explicitly closed out first.
+        conversation.op_tx.send(Event {
+            id: "spawn-turn".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message: None,
+                turn_id: "spawn-turn".to_string(),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })?;
+
+        // Tear down the parent actor exactly as dropping its owning
+        // `Thread` would: close the message channel with no more
+        // submissions in flight.
+        drop(message_tx);
+        handle.await?;
+
+        let teardown_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while Arc::strong_count(&child_conversation) > 1 && tokio::time::Instant::now() < teardown_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&child_conversation),
+            1,
+            "child feed pump must be aborted (not leaked) once the parent actor tears down"
+        );
+
         Ok(())
     }
 
