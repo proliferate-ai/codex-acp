@@ -126,12 +126,36 @@ pub(crate) struct SubagentWire {
     pub status: &'static str,
     pub summary: Option<String>,
     /// Transport descriptor the runtime uses to construct this roster
-    /// entry's `FeedRef` (`acp_child_demux:<threadId>` -- see
-    /// harness-runtime-mechanics.md §5/§7 and the per-harness membrane
-    /// table in session-activity-architecture.md).
-    pub feed_transport: String,
+    /// entry's `FeedRef` -- see harness-runtime-mechanics.md §5/§7 and the
+    /// per-harness membrane table in session-activity-architecture.md.
+    /// Structured (not the `acp_child_demux:<threadId>` colon-delimited
+    /// string) to match anyharness's `feed: Option<FeedTransportWire>`
+    /// field on `ActivitySubagentWire` (domains/activity/wire.rs) verbatim;
+    /// the colon-delimited string form still exists (`child_feed_transport`)
+    /// but is scoped to the internal `acp_child_demux` feed-buffer key on
+    /// `child_feed_event_update`, never this roster wire payload.
+    pub feed: FeedTransportWire,
     pub native: bool,
     pub updated_at_ms: i64,
+}
+
+/// Wire shape for `SubagentWire.feed`. Matches anyharness's
+/// `FeedTransportWire::AcpChildDemux` tagged-enum variant exactly
+/// (`{"kind": "acp_child_demux", "threadId": "<id>"}` --
+/// domains/activity/wire.rs). Codex only ever produces this one transport
+/// kind for subagents (harness-runtime-mechanics.md §5/§7: "acp_child_demux
+/// (subagents); none needed for terminals (pure wire)"), so this type
+/// intentionally models only that variant rather than replicating
+/// anyharness's full `tail_file | acp_child_demux | http_sse` enum --
+/// codex-acp has no code path that could ever construct the other two, and
+/// unused variants would be flagged dead code.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum FeedTransportWire {
+    AcpChildDemux {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
 }
 
 pub(crate) fn process_notification_update(process: &ProcessWire) -> SessionUpdate {
@@ -169,6 +193,15 @@ pub(crate) fn child_feed_event_update(thread_id: &str, event: &EventMsg) -> Sess
 
 pub(crate) fn child_feed_transport(thread_id: &str) -> String {
     format!("acp_child_demux:{thread_id}")
+}
+
+/// Builds the structured `SubagentWire.feed` value for a child thread id.
+/// See `FeedTransportWire`'s doc comment for why this is a single-variant
+/// type rather than a colon-delimited string like `child_feed_transport`.
+pub(crate) fn child_feed_wire(thread_id: &str) -> FeedTransportWire {
+    FeedTransportWire::AcpChildDemux {
+        thread_id: thread_id.to_string(),
+    }
 }
 
 fn tagged_update(payload: serde_json::Value) -> SessionUpdate {
@@ -339,7 +372,7 @@ mod tests {
             background: false,
             status: SUBAGENT_STATUS_RUNNING,
             summary: None,
-            feed_transport: child_feed_transport("thread-2"),
+            feed: child_feed_wire("thread-2"),
             native: true,
             updated_at_ms: 42,
         };
@@ -354,7 +387,7 @@ mod tests {
                 "background": false,
                 "status": "running",
                 "summary": null,
-                "feedTransport": "acp_child_demux:thread-2",
+                "feed": { "kind": "acp_child_demux", "threadId": "thread-2" },
                 "native": true,
                 "updatedAtMs": 42,
             })
@@ -371,7 +404,7 @@ mod tests {
             background: false,
             status: SUBAGENT_STATUS_COMPLETED,
             summary: Some("looks good".to_string()),
-            feed_transport: child_feed_transport("thread-3"),
+            feed: child_feed_wire("thread-3"),
             native: true,
             updated_at_ms: 99,
         };
@@ -380,6 +413,23 @@ mod tests {
         assert_eq!(meta["transcriptEvent"], json!(SUBAGENT_UPSERTED_EVENT));
         assert_eq!(meta["subagent"]["id"], json!("thread-3"));
         assert_eq!(meta["subagent"]["summary"], json!("looks good"));
+        assert_eq!(
+            meta["subagent"]["feed"],
+            json!({ "kind": "acp_child_demux", "threadId": "thread-3" })
+        );
+    }
+
+    #[test]
+    fn subagent_feed_wire_matches_anyharness_tagged_shape() {
+        // Structural round-trip proof for the finding this fixes: the wire
+        // must be a `{kind, threadId}` object under the `feed` key, not a
+        // colon-delimited string under `feedTransport` -- see
+        // `FeedTransportWire`'s doc comment.
+        let value = serde_json::to_value(child_feed_wire("thread-9")).unwrap();
+        assert_eq!(
+            value,
+            json!({ "kind": "acp_child_demux", "threadId": "thread-9" })
+        );
     }
 
     #[test]

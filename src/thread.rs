@@ -4617,7 +4617,7 @@ impl<A: Auth> ThreadActor<A> {
             background: false,
             status: activity::SUBAGENT_STATUS_RUNNING,
             summary: None,
-            feed_transport: activity::child_feed_transport(&thread_id),
+            feed: activity::child_feed_wire(&thread_id),
             native: true,
             updated_at_ms: now_ms(),
         };
@@ -4669,7 +4669,7 @@ impl<A: Auth> ThreadActor<A> {
             background: false,
             status,
             summary,
-            feed_transport: activity::child_feed_transport(thread_id),
+            feed: activity::child_feed_wire(thread_id),
             native: true,
             updated_at_ms: now_ms(),
         };
@@ -5371,8 +5371,8 @@ mod tests {
         assert_eq!(meta["subagent"]["background"], false);
         assert_eq!(meta["subagent"]["summary"], serde_json::Value::Null);
         assert_eq!(
-            meta["subagent"]["feedTransport"],
-            format!("acp_child_demux:{child_thread_id}")
+            meta["subagent"]["feed"],
+            serde_json::json!({ "kind": "acp_child_demux", "threadId": child_thread_id.to_string() })
         );
 
         Ok(())
@@ -5708,8 +5708,8 @@ mod tests {
         })?;
         let subagent_meta = wait_for_meta(&client, activity::SUBAGENT_UPSERTED_EVENT).await;
         assert_eq!(
-            subagent_meta["subagent"]["feedTransport"],
-            format!("acp_child_demux:{child_thread_id}")
+            subagent_meta["subagent"]["feed"],
+            serde_json::json!({ "kind": "acp_child_demux", "threadId": child_thread_id.to_string() })
         );
 
         // The child's own event stream -- routed through a completely
