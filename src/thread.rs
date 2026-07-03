@@ -4309,13 +4309,13 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
             }
-            EventMsg::ThreadGoalUpdated(event) => {
-                self.client.send_goal_transcript_event(&event.goal);
-            }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
             // - Don't have direct ACP equivalents
             // - Are handled via ResponseItem instead
+            // ThreadGoalUpdated is also skipped: replayed history is not a
+            // native transition — attach-time goal state comes from the
+            // reconcile pull (`goal/get`), never from replay.
             _ => {}
         }
     }
