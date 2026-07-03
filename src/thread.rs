@@ -4638,6 +4638,14 @@ impl<A: Auth> ThreadActor<A> {
 
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
+        } else if let EventMsg::ThreadGoalUpdated(event) = msg {
+            // Goal-engine continuation turns run without an ACP submission;
+            // their goal updates must still reach the client.
+            info!(
+                "Thread goal updated outside a tracked submission: {:?}",
+                event.goal.objective
+            );
+            self.client.send_goal_transcript_event(&event.goal);
         } else {
             warn!("Received event for unknown submission ID: {id} {msg:?}");
         }
@@ -5138,6 +5146,62 @@ mod tests {
         assert_eq!(goal_meta["goal"]["timeUsedSeconds"], 2);
         assert_eq!(goal_meta["goal"]["native"], true);
         assert_eq!(goal_meta["goal"]["updatedAtMs"], 2000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_goal_updated_without_submission_is_forwarded() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+
+        let thread_id = ThreadId::default();
+        conversation.op_tx.send(Event {
+            id: "goal-engine-turn".to_string(),
+            msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                thread_id,
+                turn_id: Some("goal-engine-turn".to_string()),
+                goal: ThreadGoal {
+                    thread_id,
+                    objective: "Ship the goal update".to_string(),
+                    status: ThreadGoalStatus::Complete,
+                    token_budget: Some(100),
+                    tokens_used: 90,
+                    time_used_seconds: 12,
+                    created_at: 1,
+                    updated_at: 2,
+                },
+            }),
+        })?;
+
+        let goal_meta = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let notifications = client.notifications.lock().unwrap();
+                    let found = notifications.iter().find_map(|notification| {
+                        match &notification.update {
+                            SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(TextContent { text, .. }),
+                                meta: Some(meta),
+                                ..
+                            }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).cloned(),
+                            _ => None,
+                        }
+                    });
+                    if let Some(meta) = found {
+                        break meta;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected an anyharness-tagged goal notification chunk");
+        drop(message_tx);
+
+        assert_eq!(goal_meta["transcriptEvent"], "goal_met");
+        assert_eq!(goal_meta["goal"]["status"], "met");
+        assert_eq!(goal_meta["goal"]["nativeStatus"], "complete");
+        assert_eq!(goal_meta["goal"]["tokensUsed"], 90);
 
         Ok(())
     }
