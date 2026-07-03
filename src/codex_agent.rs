@@ -733,6 +733,7 @@ impl CodexAgent {
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        let codex_thread = thread.clone();
         let thread = Arc::new(Thread::new(
             session_id.clone(),
             thread,
@@ -751,6 +752,14 @@ impl CodexAgent {
         }
 
         let load = thread.load().await?;
+
+        // Match the app-server resume ordering: once replay/load has
+        // completed, let core re-arm an active goal's continuation loop.
+        if self.config.features.enabled(Feature::Goals) {
+            if let Err(err) = codex_thread.continue_active_goal_if_idle().await {
+                tracing::warn!("failed to continue active goal after session restore: {err}");
+            }
+        }
 
         self.session_roots
             .lock()
