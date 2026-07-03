@@ -59,7 +59,8 @@ use codex_protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent, AgentStatus,
         ApplyPatchApprovalRequestEvent, CollabAgentSpawnEndEvent, CollabCloseEndEvent,
-        CollabWaitingEndEvent, DeprecationNoticeEvent, DynamicToolCallResponseEvent,
+        CollabResumeEndEvent, CollabWaitingEndEvent, DeprecationNoticeEvent,
+        DynamicToolCallResponseEvent,
         ElicitationAction, ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent,
         ExecCommandBeginEvent, ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus,
         ExitedReviewModeEvent, FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus,
@@ -440,6 +441,16 @@ enum ThreadMessage {
     GetConfigOptions {
         response_tx: oneshot::Sender<Result<Vec<SessionConfigOption>, Error>>,
     },
+    /// `_anyharness/activity/list`'s reconcile-on-attach pull (see
+    /// `Thread::activity_roster`): the actor's current in-memory subagent
+    /// roster snapshot, built entirely event-sourced from the
+    /// `collabAgentToolCall` lifecycle (spawn/wait/close/resume -- see
+    /// `activity.rs`'s module doc). Codex processes never survive across
+    /// turns (harness-runtime-mechanics.md §4.2), so there is never a
+    /// `processes` entry to report.
+    GetActivityRoster {
+        response_tx: oneshot::Sender<Result<Vec<SubagentWire>, Error>>,
+    },
     Prompt {
         request: PromptRequest,
         response_tx: oneshot::Sender<Result<oneshot::Receiver<Result<StopReason, Error>>, Error>>,
@@ -530,6 +541,20 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::GetConfigOptions { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    /// Serves `_anyharness/activity/list`'s reconcile-on-attach pull with the
+    /// actor's current in-memory subagent roster (see
+    /// `ThreadMessage::GetActivityRoster`).
+    pub async fn activity_roster(&self) -> Result<Vec<SubagentWire>, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::GetActivityRoster { response_tx };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -3560,6 +3585,16 @@ struct ThreadActor<A> {
     /// `PromptState::active_commands`, because collab wait/close can land
     /// in a later turn than the spawn.
     spawned_agents: HashMap<String, SpawnedAgentSnapshot>,
+    /// Current subagent roster snapshot, keyed by child thread id -- the
+    /// last `SubagentWire` upserted for each collab child (see
+    /// `upsert_subagent`). Serves `_anyharness/activity/list`
+    /// (`ThreadMessage::GetActivityRoster`) so a session reattach can
+    /// reconcile the roster instead of it staying permanently empty (the
+    /// harness never had a way to re-list it before this cache existed).
+    /// Upsert-only, matching anyharness's own roster semantics
+    /// (`reconcile_roster` never deletes) -- terminal entries (completed/
+    /// failed) stay listed.
+    subagent_roster: HashMap<String, SubagentWire>,
 }
 
 /// Spawn-time identity captured from `CollabAgentSpawnEnd`, the only collab
@@ -3605,6 +3640,7 @@ impl<A: Auth> ThreadActor<A> {
             child_resolver,
             child_feed_pump_handles: HashMap::new(),
             spawned_agents: HashMap::new(),
+            subagent_roster: HashMap::new(),
         }
     }
 
@@ -3673,6 +3709,10 @@ impl<A: Auth> ThreadActor<A> {
             ThreadMessage::GetConfigOptions { response_tx } => {
                 let result = self.config_options().await;
                 drop(response_tx.send(result));
+            }
+            ThreadMessage::GetActivityRoster { response_tx } => {
+                let roster = self.subagent_roster.values().cloned().collect();
+                drop(response_tx.send(Ok(roster)));
             }
             ThreadMessage::Prompt {
                 request,
@@ -4535,6 +4575,7 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::CollabAgentSpawnEnd(event) => self.collab_agent_spawn_end(event),
             EventMsg::CollabWaitingEnd(event) => self.collab_agent_waiting_end(event),
             EventMsg::CollabCloseEnd(event) => self.collab_agent_close_end(event),
+            EventMsg::CollabResumeEnd(event) => self.collab_agent_resume_end(event),
             _ => {}
         }
 
@@ -4621,8 +4662,7 @@ impl<A: Auth> ThreadActor<A> {
             native: true,
             updated_at_ms: now_ms(),
         };
-        self.client
-            .send_notification(activity::subagent_notification_update(&wire));
+        self.upsert_subagent(wire);
 
         self.start_child_feed_pump(thread_id);
     }
@@ -4655,10 +4695,37 @@ impl<A: Auth> ThreadActor<A> {
         self.spawned_agents.remove(&thread_id);
     }
 
-    /// Shared tail for waiting/close: map the native status, backfill
-    /// identity fields from the spawn-time snapshot (wait/close events
-    /// don't carry model/prompt/role themselves), and emit.
-    fn emit_subagent_status(&self, thread_id: &str, status: &AgentStatus) {
+    /// `CollabResumeEnd`: task (a) roster. A `resume_agent` tool call can
+    /// reopen a child thread that a prior `CollabCloseEnd` already marked
+    /// terminal (completed/failed) -- this is the authoritative status
+    /// transition back out of that terminal state, mirrored the same way
+    /// `collab_agent_waiting_end`/`collab_agent_close_end` mirror their own
+    /// `AgentStatus`. Without this, a resumed child's roster row would
+    /// silently keep showing its pre-resume terminal status forever, since
+    /// nothing else re-emits a `subagent_upserted` for it. Backfills
+    /// identity from the event's own nickname/role (mirroring
+    /// `CollabAgentSpawnEnd`) rather than only `spawned_agents`, since a
+    /// prior close may have already evicted that snapshot.
+    fn collab_agent_resume_end(&mut self, event: &CollabResumeEndEvent) {
+        let thread_id = event.receiver_thread_id.to_string();
+        let identity = event
+            .receiver_agent_role
+            .clone()
+            .or_else(|| event.receiver_agent_nickname.clone());
+        let entry = self.spawned_agents.entry(thread_id.clone()).or_default();
+        if entry.agent_type.is_none() {
+            entry.agent_type = identity;
+        }
+        self.emit_subagent_status(&thread_id, &event.status);
+    }
+
+    /// Shared tail for waiting/close/resume: map the native status, backfill
+    /// identity fields from the spawn-time snapshot (wait/close/resume
+    /// events don't carry model/prompt themselves), and emit -- both as a
+    /// live `subagent_upserted` notification and into `subagent_roster` so
+    /// `_anyharness/activity/list` can serve this status on a later
+    /// reconcile-on-attach pull.
+    fn emit_subagent_status(&mut self, thread_id: &str, status: &AgentStatus) {
         let (status, summary) = activity::map_agent_status(status);
         let snapshot = self.spawned_agents.get(thread_id).cloned().unwrap_or_default();
         let wire = SubagentWire {
@@ -4673,6 +4740,15 @@ impl<A: Auth> ThreadActor<A> {
             native: true,
             updated_at_ms: now_ms(),
         };
+        self.upsert_subagent(wire);
+    }
+
+    /// Records `wire` as this child's current roster entry and emits the
+    /// live `subagent_upserted` notification for it. The single write path
+    /// into `subagent_roster` -- every roster-affecting event (spawn/wait/
+    /// close/resume) goes through here so the two can never drift apart.
+    fn upsert_subagent(&mut self, wire: SubagentWire) {
+        self.subagent_roster.insert(wire.id.clone(), wire.clone());
         self.client
             .send_notification(activity::subagent_notification_update(&wire));
     }
@@ -5513,6 +5589,155 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_collab_agent_resume_end_reopens_a_closed_agents_roster_entry()
+    -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+        let child_thread_id = ThreadId::default();
+
+        // Close the agent first -- its roster row goes terminal and its
+        // spawn-time snapshot is evicted (mirrors
+        // `test_collab_agent_close_end_shutdown_maps_to_completed_not_failed`).
+        conversation.op_tx.send(Event {
+            id: "close-turn".to_string(),
+            msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                call_id: "call-3".to_string(),
+                completed_at_ms: 3_000,
+                sender_thread_id: ThreadId::default(),
+                receiver_thread_id: child_thread_id,
+                receiver_agent_nickname: None,
+                receiver_agent_role: Some("reviewer".to_string()),
+                status: AgentStatus::Shutdown,
+            }),
+        })?;
+        wait_for_meta_matching(&client, activity::SUBAGENT_UPSERTED_EVENT, |m| {
+            m["subagent"]["status"] == "completed"
+        })
+        .await;
+
+        // Before the fix, `CollabResumeBegin`/`CollabResumeEnd` were
+        // explicit no-ops (see the finding this regresses): the roster
+        // would keep reporting "completed" forever even though the agent
+        // is running again.
+        conversation.op_tx.send(Event {
+            id: "resume-turn".to_string(),
+            msg: EventMsg::CollabResumeEnd(CollabResumeEndEvent {
+                call_id: "call-4".to_string(),
+                completed_at_ms: 4_000,
+                sender_thread_id: ThreadId::default(),
+                receiver_thread_id: child_thread_id,
+                receiver_agent_nickname: None,
+                receiver_agent_role: Some("reviewer".to_string()),
+                status: AgentStatus::Running,
+            }),
+        })?;
+
+        let meta = wait_for_meta_matching(&client, activity::SUBAGENT_UPSERTED_EVENT, |m| {
+            m["subagent"]["status"] == "running"
+        })
+        .await;
+        drop(message_tx);
+
+        assert_eq!(meta["subagent"]["id"], child_thread_id.to_string());
+        assert_eq!(meta["subagent"]["status"], "running");
+        // Identity backfilled from the resume event's own role since the
+        // close already evicted the spawn-time snapshot.
+        assert_eq!(meta["subagent"]["agentType"], "reviewer");
+
+        Ok(())
+    }
+
+    // --- `_anyharness/activity/list` reconcile-on-attach roster ---
+
+    #[tokio::test]
+    async fn test_activity_roster_accumulates_across_the_collab_lifecycle() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+
+        let first_child = ThreadId::default();
+        let second_child = ThreadId::default();
+        conversation.op_tx.send(Event {
+            id: "spawn-1".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-1".to_string(),
+                completed_at_ms: 1_000,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: Some(first_child),
+                new_agent_nickname: None,
+                new_agent_role: Some("reviewer".to_string()),
+                prompt: "review the diff".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        })?;
+        conversation.op_tx.send(Event {
+            id: "spawn-2".to_string(),
+            msg: EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "call-2".to_string(),
+                completed_at_ms: 1_500,
+                sender_thread_id: ThreadId::default(),
+                new_thread_id: Some(second_child),
+                new_agent_nickname: None,
+                new_agent_role: Some("planner".to_string()),
+                prompt: "plan the work".to_string(),
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        })?;
+        conversation.op_tx.send(Event {
+            id: "close-1".to_string(),
+            msg: EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                call_id: "call-3".to_string(),
+                completed_at_ms: 2_000,
+                sender_thread_id: ThreadId::default(),
+                receiver_thread_id: first_child,
+                receiver_agent_nickname: None,
+                receiver_agent_role: None,
+                status: AgentStatus::Shutdown,
+            }),
+        })?;
+
+        wait_for_meta_matching(&client, activity::SUBAGENT_UPSERTED_EVENT, |m| {
+            m["subagent"]["id"] == first_child.to_string() && m["subagent"]["status"] == "completed"
+        })
+        .await;
+        wait_for_meta_matching(&client, activity::SUBAGENT_UPSERTED_EVENT, |m| {
+            m["subagent"]["id"] == second_child.to_string() && m["subagent"]["status"] == "running"
+        })
+        .await;
+
+        // `Thread::activity_roster` (what `_anyharness/activity/list`'s
+        // handler in `codex_agent.rs` calls) is just this same
+        // `GetActivityRoster` round trip over a real `Thread` handle --
+        // exercise it directly here to keep this test at the same
+        // lightweight `ThreadActor` + raw channel level as its siblings
+        // (see `setup()`). This is the reconcile-on-attach roster pull that
+        // did not exist at all before this fix (the ext method had no
+        // handler, so anyharness's `reconcile_on_attach` always fell back
+        // to an empty result).
+        let (response_tx, response_rx) = oneshot::channel();
+        message_tx.send(ThreadMessage::GetActivityRoster { response_tx })?;
+        let mut roster = response_rx.await??;
+        roster.sort_by(|a, b| a.id.cmp(&b.id));
+
+        assert_eq!(roster.len(), 2, "both spawned children must be listed");
+        let first = roster
+            .iter()
+            .find(|w| w.id == first_child.to_string())
+            .expect("closed child still listed (upsert-only, matching anyharness semantics)");
+        assert_eq!(first.status, activity::SUBAGENT_STATUS_COMPLETED);
+        let second = roster
+            .iter()
+            .find(|w| w.id == second_child.to_string())
+            .expect("running child listed");
+        assert_eq!(second.status, activity::SUBAGENT_STATUS_RUNNING);
+        assert_eq!(second.agent_type.as_deref(), Some("planner"));
+
+        drop(message_tx);
+        Ok(())
+    }
+
     // --- Task (c): commandExecution item lifecycle -> process roster ---
 
     fn exec_command_begin_event(call_id: &str, started_at_ms: i64, cwd: PathBuf) -> EventMsg {
@@ -5649,6 +5874,33 @@ mod tests {
         }
     }
 
+    /// Like `StubChildThreadResolver`, but `.take()`s its one child out of a
+    /// `Mutex` on resolution instead of `.clone()`-ing it out of a `HashMap`
+    /// it keeps holding forever. Used where a test needs to reason exactly
+    /// about how many strong references to the resolved child thread exist
+    /// afterward -- with the plain `HashMap`-backed resolver, the map's own
+    /// held clone would be an extra, resolver-lifetime-dependent reference
+    /// that has nothing to do with the pump task itself.
+    struct SingleUseChildThreadResolver {
+        thread_id: String,
+        child: std::sync::Mutex<Option<Arc<StubCodexThread>>>,
+    }
+
+    impl ChildThreadResolver for SingleUseChildThreadResolver {
+        fn resolve_child_thread<'a>(&'a self, thread_id: &'a str) -> ChildThreadFuture<'a> {
+            let found = if thread_id == self.thread_id {
+                self.child.lock().unwrap().take()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                found
+                    .map(|thread| thread as Arc<dyn CodexThreadImpl>)
+                    .ok_or(CodexErr::InternalAgentDied)
+            })
+        }
+    }
+
     // --- Task (b): child-thread demux ---
 
     /// End-to-end: a successful spawn starts the child feed pump
@@ -5753,33 +6005,6 @@ mod tests {
 
         drop(message_tx);
         Ok(())
-    }
-
-    /// Like `StubChildThreadResolver`, but `.take()`s its one child out of a
-    /// `Mutex` on resolution instead of `.clone()`-ing it out of a `HashMap`
-    /// it keeps holding forever. Used where a test needs to reason exactly
-    /// about how many strong references to the resolved child thread exist
-    /// afterward -- with the plain `HashMap`-backed resolver, the map's own
-    /// held clone would be an extra, resolver-lifetime-dependent reference
-    /// that has nothing to do with the pump task itself.
-    struct SingleUseChildThreadResolver {
-        thread_id: String,
-        child: std::sync::Mutex<Option<Arc<StubCodexThread>>>,
-    }
-
-    impl ChildThreadResolver for SingleUseChildThreadResolver {
-        fn resolve_child_thread<'a>(&'a self, thread_id: &'a str) -> ChildThreadFuture<'a> {
-            let found = if thread_id == self.thread_id {
-                self.child.lock().unwrap().take()
-            } else {
-                None
-            };
-            Box::pin(async move {
-                found
-                    .map(|thread| thread as Arc<dyn CodexThreadImpl>)
-                    .ok_or(CodexErr::InternalAgentDied)
-            })
-        }
     }
 
     /// The pump's `next_event()` loop only exits on the child's own

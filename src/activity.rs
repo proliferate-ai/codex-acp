@@ -15,9 +15,12 @@
 //! all fields serialize (nulls included), a `native: true` marker, and an
 //! `updatedAtMs` freshness stamp on every emission.
 
-use agent_client_protocol::schema::{ContentChunk, Meta, SessionUpdate};
+use agent_client_protocol::{
+    self as acp, Error, JsonRpcMessage, JsonRpcRequest, UntypedMessage,
+    schema::{ContentChunk, Meta, SessionUpdate},
+};
 use codex_protocol::protocol::{AgentStatus, EventMsg};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::goals::ANYHARNESS_META_KEY;
@@ -31,6 +34,12 @@ pub(crate) const SUBAGENT_UPSERTED_EVENT: &str = "subagent_upserted";
 /// roster mutation itself -- purely a transport for the demuxed child feed
 /// (see `child_feed_event_update`).
 pub(crate) const CHILD_DEMUX_EVENT: &str = "acp_child_demux";
+
+/// The attach-time roster reconcile pull. Mirrors anyharness's
+/// `ACTIVITY_LIST_EXT_METHOD` (domains/activity/wire.rs) verbatim -- ACP
+/// strips the leading `_` before dispatch; the client sends the underscored
+/// form, same convention as the `_anyharness/goal/*` methods in `goals.rs`.
+pub(crate) const ACTIVITY_LIST_WIRE_METHOD: &str = "_anyharness/activity/list";
 
 pub(crate) const PROCESS_STATUS_RUNNING: &str = "running";
 pub(crate) const PROCESS_STATUS_EXITED: &str = "exited";
@@ -202,6 +211,51 @@ pub(crate) fn child_feed_wire(thread_id: &str) -> FeedTransportWire {
     FeedTransportWire::AcpChildDemux {
         thread_id: thread_id.to_string(),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ActivityListParams {
+    pub session_id: String,
+}
+
+/// Typed request covering the `_anyharness/activity/list` wire method (the
+/// attach-time roster reconcile pull -- see `crate::goals::AnyharnessGoalRequest`
+/// for the precedent this mirrors, including why an ostensibly one-variant
+/// enum is still used: it keeps the ACP builder registration and
+/// `matches_method`/`parse_message` boilerplate identical to the goal ext
+/// methods, and leaves room for future activity ext methods).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AnyharnessActivityRequest {
+    List(ActivityListParams),
+}
+
+impl JsonRpcMessage for AnyharnessActivityRequest {
+    fn matches_method(method: &str) -> bool {
+        method == ACTIVITY_LIST_WIRE_METHOD
+    }
+
+    fn method(&self) -> &str {
+        match self {
+            AnyharnessActivityRequest::List(_) => ACTIVITY_LIST_WIRE_METHOD,
+        }
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, Error> {
+        UntypedMessage::new(self.method(), self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, Error> {
+        match method {
+            ACTIVITY_LIST_WIRE_METHOD => acp::util::json_cast_params(params).map(Self::List),
+            _ => Err(Error::method_not_found()),
+        }
+    }
+}
+
+impl JsonRpcRequest for AnyharnessActivityRequest {
+    type Response = serde_json::Value;
 }
 
 fn tagged_update(payload: serde_json::Value) -> SessionUpdate {
@@ -486,5 +540,43 @@ mod tests {
         let truncated = truncate_description(&long).unwrap();
         assert_eq!(truncated.chars().count(), 241); // 240 + ellipsis
         assert!(truncated.ends_with('\u{2026}'));
+    }
+
+    // --- `_anyharness/activity/list` wire method ---
+
+    #[test]
+    fn activity_list_wire_method_matches_and_parses() {
+        assert!(AnyharnessActivityRequest::matches_method(
+            "_anyharness/activity/list"
+        ));
+        assert!(!AnyharnessActivityRequest::matches_method(
+            "anyharness/activity/list"
+        ));
+        assert!(!AnyharnessActivityRequest::matches_method("session/prompt"));
+        assert!(!AnyharnessActivityRequest::matches_method(
+            "_anyharness/goal/get"
+        ));
+
+        let parsed = AnyharnessActivityRequest::parse_message(
+            ACTIVITY_LIST_WIRE_METHOD,
+            &json!({ "sessionId": "thread-1" }),
+        )
+        .expect("parse activity/list params");
+        match parsed {
+            AnyharnessActivityRequest::List(params) => {
+                assert_eq!(params.session_id, "thread-1");
+            }
+        }
+    }
+
+    #[test]
+    fn activity_list_wire_method_rejects_unknown_method() {
+        assert!(
+            AnyharnessActivityRequest::parse_message(
+                "_anyharness/activity/nonsense",
+                &json!({ "sessionId": "thread-1" }),
+            )
+            .is_err()
+        );
     }
 }

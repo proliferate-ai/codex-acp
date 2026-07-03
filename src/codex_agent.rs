@@ -43,6 +43,7 @@ use std::{
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::activity::{ActivityListParams, AnyharnessActivityRequest};
 use crate::goals::{
     AnyharnessGoalRequest, GOAL_CLEARED_EVENT, GoalSessionParams, GoalSetParams,
     GoalSetStatusParam, GoalWire, goal_notification_update, initialize_capability_meta,
@@ -321,6 +322,22 @@ impl CodexAgent {
                         let session_cx = cx.clone();
                         cx.spawn(async move {
                             agent.handle_goal_request(request, responder, session_cx).await;
+                            Ok(())
+                        })?;
+                        Ok(())
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let agent = agent.clone();
+                    async move |request: AnyharnessActivityRequest,
+                                responder,
+                                cx: ConnectionTo<Client>| {
+                        let agent = agent.clone();
+                        cx.spawn(async move {
+                            agent.handle_activity_request(request, responder).await;
                             Ok(())
                         })?;
                         Ok(())
@@ -1169,6 +1186,47 @@ impl CodexAgent {
         if let Err(e) = cx.send_notification(SessionNotification::new(session_id, update)) {
             tracing::error!("failed to send goal notification: {e:?}");
         }
+    }
+}
+
+/// Anyharness ActivityPort ext method (`_anyharness/activity/list`).
+///
+/// Serves the attach-time roster reconcile pull anyharness's
+/// `ActivityRuntime::reconcile_on_attach` sends on session load/resume (see
+/// domains/activity/runtime.rs's doc comment: "Codex child threads are
+/// resumable, so the reconcile re-lists them via
+/// `_anyharness/activity/list`"). Before this, codex-acp had no handler at
+/// all for the method, so the pull always fell back to an empty roster and
+/// a reattached session's subagents never reconciled.
+impl CodexAgent {
+    async fn handle_activity_request(
+        &self,
+        request: AnyharnessActivityRequest,
+        responder: Responder<serde_json::Value>,
+    ) {
+        match request {
+            AnyharnessActivityRequest::List(params) => {
+                let result = self.activity_list(params).await;
+                if let Err(e) = responder.respond_with_result(result) {
+                    tracing::error!("failed to respond to activity/list: {e:?}");
+                }
+            }
+        }
+    }
+
+    /// Codex processes never survive across turns (harness-runtime-
+    /// mechanics.md §4.2 -- "nothing runs between turns"), so `processes` is
+    /// always empty here; only the in-memory subagent roster the running
+    /// thread's actor has accumulated needs relisting. An unknown or
+    /// not-currently-running session is not an error the caller needs to
+    /// distinguish: anyharness's own reconcile treats any failure the same
+    /// as an empty result (domains/activity/runtime.rs), so surfacing
+    /// `resource_not_found` here is enough.
+    async fn activity_list(&self, params: ActivityListParams) -> Result<serde_json::Value, Error> {
+        let session_id = SessionId::new(params.session_id);
+        let thread = self.get_thread(&session_id)?;
+        let agents = thread.activity_roster().await?;
+        Ok(json!({ "processes": [], "agents": agents }))
     }
 }
 
