@@ -4359,17 +4359,46 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_event(&mut self, Event { id, msg }: Event) {
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else if let EventMsg::ThreadGoalUpdated(event) = msg {
-            // Goal-engine continuation turns run without an ACP submission;
-            // their goal updates must still reach the client.
-            info!(
-                "Thread goal updated outside a tracked submission: {:?}",
-                event.goal.objective
-            );
-            self.client.send_goal_transcript_event(&event.goal);
-        } else {
-            warn!("Received event for unknown submission ID: {id} {msg:?}");
+            return;
         }
+
+        // Goal-engine continuation turns run without an ACP `session/prompt`
+        // submission: codex-core starts them internally with a fresh sub_id
+        // that never went through `handle_prompt`, so their first event
+        // arrives for an id we've never seen. Lazily register a synthetic
+        // submission the moment that happens so the turn's transcript
+        // content, tool calls, and approval requests flow through the same
+        // per-turn state machine (and permission-response routing) as a
+        // normal turn, instead of being silently dropped.
+        info!("Registering synthetic submission for engine-initiated turn without an ACP submission: {id}");
+        let client = self.client.clone();
+        let submission = self.register_engine_initiated_submission(id);
+        submission.handle_event(&client, msg).await;
+    }
+
+    /// Creates and registers a `SubmissionState` for an engine-initiated turn
+    /// (e.g. a goal continuation turn) that has no corresponding ACP
+    /// `session/prompt` call. There is no RPC response to eventually resolve,
+    /// so we drain the paired oneshot receiver in the background purely to
+    /// keep `PromptState::is_active` true while the turn is in flight; it
+    /// naturally goes inactive (and gets reaped by the litter collector in
+    /// `spawn`) once the turn completes and `response_tx` is consumed like
+    /// any other turn.
+    fn register_engine_initiated_submission(
+        &mut self,
+        submission_id: String,
+    ) -> &mut SubmissionState {
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            drop(response_rx.await);
+        });
+        let state = SubmissionState::Prompt(PromptState::new(
+            submission_id.clone(),
+            self.thread.clone(),
+            self.resolution_tx.clone(),
+            response_tx,
+        ));
+        self.submissions.entry(submission_id).or_insert(state)
     }
 }
 
@@ -4920,6 +4949,117 @@ mod tests {
         assert_eq!(goal_meta["goal"]["status"], "met");
         assert_eq!(goal_meta["goal"]["nativeStatus"], "complete");
         assert_eq!(goal_meta["goal"]["tokensUsed"], 90);
+
+        Ok(())
+    }
+
+    /// Goal-engine continuation turns run without an ACP `session/prompt`
+    /// submission (see `register_engine_initiated_submission`). Their
+    /// transcript content and approval requests must still reach the
+    /// client instead of being dropped as "unknown submission ID", and the
+    /// approval decision must round-trip back into a real
+    /// `Op::ExecApproval` submission.
+    #[tokio::test]
+    async fn test_engine_initiated_turn_forwards_transcript_and_approvals() -> anyhow::Result<()>
+    {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+
+        // Note: no `ThreadMessage::Prompt` is ever sent for this id, mirroring
+        // a goal continuation turn that codex-core starts internally with a
+        // fresh sub_id the ACP layer never registered.
+        let turn_id = "goal-continuation-turn".to_string();
+
+        conversation.op_tx.send(Event {
+            id: turn_id.clone(),
+            msg: EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id: turn_id.clone(),
+                turn_id: turn_id.clone(),
+                item_id: turn_id.clone(),
+                delta: "continuation work".to_string(),
+            }),
+        })?;
+
+        conversation.op_tx.send(Event {
+            id: turn_id.clone(),
+            msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                call_id: "call-id".to_string(),
+                approval_id: Some("approval-id".to_string()),
+                turn_id: turn_id.clone(),
+                started_at_ms: 0,
+                command: vec!["echo".to_string(), "hi".to_string()],
+                cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                reason: None,
+                network_approval_context: None,
+                proposed_execpolicy_amendment: None,
+                proposed_network_policy_amendments: None,
+                additional_permissions: None,
+                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "echo hi".to_string(),
+                }],
+            }),
+        })?;
+
+        // The continuation turn's assistant content must be forwarded, not
+        // dropped.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let notifications = client.notifications.lock().unwrap();
+                    let found = notifications.iter().any(|notification| {
+                        matches!(
+                            &notification.update,
+                            SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(TextContent { text, .. }),
+                                ..
+                            }) if text == "continuation work"
+                        )
+                    });
+                    if found {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("engine-initiated turn content should be forwarded to the client");
+
+        // The approval request must reach the client instead of wedging in
+        // codex-core because codex-acp never answers it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !client.permission_requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("engine-initiated turn approval request should reach the client");
+
+        // The (stubbed, auto-cancelled) permission response must round-trip
+        // back into a real `Op::ExecApproval`, proving the synthetic
+        // submission was registered under the turn's id so
+        // `PermissionRequestResolved` routing finds it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if conversation
+                    .ops
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|op| matches!(op, Op::ExecApproval { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval resolution should round-trip into an Op::ExecApproval submission");
+
+        drop(message_tx);
 
         Ok(())
     }
