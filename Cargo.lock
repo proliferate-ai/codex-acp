@@ -3250,7 +3250,6 @@ dependencies = [
 [[package]]
 name = "codex-utils-pty"
 version = "0.144.1"
-source = "git+https://github.com/openai/codex?tag=rust-v0.144.1#44918ea10c0f99151c6710411b4322c2f5c96bea"
 dependencies = [
  "anyhow",
  "filedescriptor",
