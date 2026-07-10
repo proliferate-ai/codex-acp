@@ -1524,7 +1524,6 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
-                started_at: _,
                 ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
@@ -1545,9 +1544,6 @@ impl PromptState {
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
-                images: _,
-                text_elements: _,
-                local_images: _,
                 ..
             }) => {
                 info!("User message: {message:?}");
@@ -1690,7 +1686,6 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
-                mcp_app_resource_uri: _,
                 ..
             }) => {
                 info!(
@@ -1704,7 +1699,6 @@ impl PromptState {
                 invocation,
                 duration,
                 result,
-                mcp_app_resource_uri: _,
                 ..
             }) => {
                 info!(
@@ -2284,9 +2278,6 @@ impl PromptState {
             call_id,
             changes,
             reason,
-            // grant_root doesn't seem to be set anywhere on the codex side
-            grant_root: _,
-            turn_id: _,
             ..
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
@@ -2943,7 +2934,6 @@ impl PromptState {
             turn_id: _,
             reason,
             permissions,
-            cwd: _,
             ..
         } = event;
 

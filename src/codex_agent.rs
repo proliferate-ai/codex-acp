@@ -447,7 +447,6 @@ impl CodexAgent {
         let InitializeRequest {
             protocol_version,
             client_capabilities,
-            client_info: _, // TODO: save and pass into Codex somehow
             ..
         } = request;
         debug!("Received initialize request with protocol version {protocol_version:?}",);
