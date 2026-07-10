@@ -10,6 +10,8 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
 - Following
 - Edit review
 - TODO lists
+- Independent approval/sandbox and Default/Plan collaboration controls
+- Model-aware reasoning effort (including Max/Ultra where supported) and Fast mode controls
 - Slash commands:
   - /review (with optional instructions)
   - /review-branch
