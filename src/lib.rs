@@ -1,5 +1,9 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+// The ACP request-handler builder plus the goal extension wiring produce a
+// deeply nested async state machine whose type-layout query exceeds the
+// default recursion limit (128).
+#![recursion_limit = "256"]
 
 use agent_client_protocol::ByteStreams;
 use codex_core::config::{Config, ConfigOverrides};

@@ -14,14 +14,18 @@ use acp::schema::{
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, Responder};
 use agent_client_protocol as acp;
 use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
+use codex_analytics::AnalyticsEventsClient;
 use codex_core::{
-    CodexThread, ExternalGoalPreviousStatus, ExternalGoalSet, NewThread, RolloutRecorder,
-    StateDbHandle, ThreadManager, config::Config, find_thread_path_by_id_str, init_state_db,
-    resolve_installation_id, thread_store_from_config,
+    NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
+    find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, ExecServerRuntimePaths};
-use codex_extension_api::empty_extension_registry;
+use codex_extension_api::{ExtensionEventSink, ExtensionRegistry, ExtensionRegistryBuilder};
 use codex_features::Feature;
+use codex_goal_extension::{
+    GoalObjectiveUpdate, GoalService, GoalServiceError, GoalSetOutcome, GoalSetRequest,
+    GoalTokenBudgetUpdate,
+};
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::{
     CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR,
@@ -32,7 +36,7 @@ use codex_login::{
 };
 use codex_protocol::{
     ThreadId,
-    protocol::{InitialHistory, SessionSource, validate_thread_goal_objective},
+    protocol::{InitialHistory, SessionSource},
 };
 use serde_json::json;
 use codex_thread_store::{
@@ -42,7 +46,7 @@ use codex_thread_store::{
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use tracing::{debug, info};
 use unicode_segmentation::UnicodeSegmentation;
@@ -51,7 +55,9 @@ use crate::goals::{
     AnyharnessGoalRequest, GOAL_CLEARED_EVENT, GoalSessionParams, GoalSetParams,
     GoalSetStatusParam, GoalWire, goal_notification_update, initialize_capability_meta,
 };
-use crate::thread::{ConfiguredModelsManager, Thread};
+use crate::thread::{
+    ConfiguredModelsManager, GoalExtensionEventSink, GoalNotificationRegistry, Thread,
+};
 
 /// The Codex implementation of the ACP Agent.
 ///
@@ -64,12 +70,19 @@ pub struct CodexAgent {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     /// The underlying codex configuration
     config: Config,
-    /// Thread manager for handling sessions
-    thread_manager: ThreadManager,
+    /// Thread manager for handling sessions. Held behind an `Arc` because the
+    /// installed goal extension holds a `Weak<ThreadManager>` back-reference.
+    thread_manager: Arc<ThreadManager>,
     /// Store for listing and updating persisted thread metadata
     thread_store: Arc<dyn ThreadStore>,
     /// SQLite-backed Codex state index, when initialization succeeds
     state_db: Option<StateDbHandle>,
+    /// Native goal service driving the `_anyharness/goal/*` ext methods and the
+    /// installed goal extension's per-thread runtimes.
+    goal_service: Arc<GoalService>,
+    /// Registry the goal extension's event sink uses to route goal updates to
+    /// the owning session's ACP client.
+    goal_registry: GoalNotificationRegistry,
     /// Active sessions mapped by `SessionId`
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Thread>>>>,
     /// Session working directories for filesystem sandboxing
@@ -103,20 +116,44 @@ impl CodexAgent {
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
         ));
-        let thread_manager = ThreadManager::new(
-            &config,
-            auth_manager.clone(),
-            SessionSource::Unknown,
-            environment_manager,
-            empty_extension_registry(),
-            user_instructions_provider,
-            None,
-            thread_store.clone(),
-            codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
-            installation_id,
-            None,
-            None,
-        );
+
+        // Native goals moved into an installed extension at codex core
+        // rust-v0.144.1. Wire the goal service, its host event sink, and the
+        // extension into the thread manager so external goal mutations and the
+        // idle-continuation loop behave like the app-server backend.
+        let goal_service = Arc::new(GoalService::new());
+        let goal_registry = GoalNotificationRegistry::new();
+
+        let thread_manager = {
+            let auth_manager = auth_manager.clone();
+            let thread_store = thread_store.clone();
+            let goal_service = goal_service.clone();
+            let goal_registry = goal_registry.clone();
+            let state_db = state_db.clone();
+            let config = config.clone();
+            Arc::new_cyclic(move |weak_thread_manager: &Weak<ThreadManager>| {
+                let extension_registry = build_goal_extension_registry(
+                    state_db.clone(),
+                    weak_thread_manager.clone(),
+                    goal_service,
+                    goal_registry,
+                );
+                ThreadManager::new(
+                    &config,
+                    auth_manager,
+                    SessionSource::Unknown,
+                    environment_manager,
+                    extension_registry,
+                    user_instructions_provider,
+                    None,
+                    thread_store,
+                    codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
+                    installation_id,
+                    None,
+                    None,
+                )
+            })
+        };
         Ok(Self {
             auth_manager,
             client_capabilities,
@@ -124,6 +161,8 @@ impl CodexAgent {
             thread_manager,
             thread_store,
             state_db,
+            goal_service,
+            goal_registry,
             sessions: Arc::default(),
             session_roots,
         })
@@ -626,6 +665,7 @@ impl CodexAgent {
             self.client_capabilities.clone(),
             config.clone(),
             cx,
+            self.goal_registry.clone(),
         ));
         let load = thread.load().await?;
 
@@ -745,6 +785,7 @@ impl CodexAgent {
             self.client_capabilities.clone(),
             config.clone(),
             cx,
+            self.goal_registry.clone(),
         ));
 
         if replay_history {
@@ -754,11 +795,13 @@ impl CodexAgent {
         let load = thread.load().await?;
 
         // Match the app-server resume ordering: once replay/load has
-        // completed, let core re-arm an active goal's continuation loop.
+        // completed, emit the idle lifecycle so the installed goal extension
+        // re-arms an active goal's continuation loop (app-server parity —
+        // `emit_resume_goal_snapshot_and_continue`). Replaces the pre-0.144
+        // `continue_active_goal_if_idle`, which moved out of `CodexThread`
+        // into the goal extension's idle handler.
         if self.config.features.enabled(Feature::Goals) {
-            if let Err(err) = codex_thread.continue_active_goal_if_idle().await {
-                tracing::warn!("failed to continue active goal after session restore: {err}");
-            }
+            codex_thread.emit_thread_idle_lifecycle_if_idle().await;
         }
 
         self.session_roots
@@ -903,16 +946,16 @@ struct GoalThreadContext {
     thread_id: ThreadId,
     state_db: StateDbHandle,
     rollout_path: PathBuf,
-    running_thread: Option<Arc<CodexThread>>,
 }
 
 /// Anyharness GoalPort ext methods (`_anyharness/goal/set|get|clear`).
 ///
-/// Ports the app-server `ThreadGoalRequestProcessor` semantics from codex
-/// rust-v0.137.0 onto the ACP surface: persist goal mutations through the
-/// state-db `GoalStore`, then apply runtime effects on the running thread via
-/// `ExternalGoalSet` / external clear. Every successful mutation additionally
-/// emits a tagged zero-length `AgentMessageChunk` notification.
+/// Delegates goal state mutation and runtime effects to the native
+/// `codex_goal_extension::GoalService` (the same backend the codex app-server
+/// `ThreadGoalRequestProcessor` uses): the service persists the goal through
+/// the state db, drives the running thread's goal runtime, and returns the
+/// updated goal. Every successful mutation additionally emits a tagged
+/// zero-length `AgentMessageChunk` notification for the anyharness runtime.
 impl CodexAgent {
     async fn handle_goal_request(
         &self,
@@ -924,18 +967,19 @@ impl CodexAgent {
             AnyharnessGoalRequest::Set(params) => {
                 let session_id = SessionId::new(params.session_id.clone());
                 match self.goal_set(params).await {
-                    Ok((goal_wire, running_thread, external_set)) => {
+                    Ok((goal_wire, outcome)) => {
                         let transcript_event = goal_wire.transcript_event();
-                        respond_json(responder, json!({ "goal": goal_wire }));
+                        respond_json(responder, json!({ "goal": &goal_wire }));
                         Self::send_goal_notification(
                             &cx,
                             session_id,
                             transcript_event,
                             Some(&goal_wire),
                         );
-                        if let Some(thread) = running_thread {
-                            thread.apply_external_goal_set(external_set).await;
-                        }
+                        // Apply runtime effects last, mirroring the app-server
+                        // ordering (respond, notify, then re-arm/continue the
+                        // running thread's goal loop).
+                        outcome.apply_runtime_effects(&self.goal_service).await;
                     }
                     Err(error) => respond_error(responder, error),
                 }
@@ -949,12 +993,7 @@ impl CodexAgent {
             AnyharnessGoalRequest::Clear(params) => {
                 let session_id = SessionId::new(params.session_id.clone());
                 match self.goal_clear(params).await {
-                    Ok((cleared, running_thread)) => {
-                        if cleared {
-                            if let Some(thread) = running_thread.as_ref() {
-                                thread.apply_external_goal_clear().await;
-                            }
-                        }
+                    Ok(cleared) => {
                         respond_json(responder, json!({ "cleared": cleared }));
                         if cleared {
                             Self::send_goal_notification(&cx, session_id, GOAL_CLEARED_EVENT, None);
@@ -969,142 +1008,79 @@ impl CodexAgent {
     async fn goal_set(
         &self,
         params: GoalSetParams,
-    ) -> Result<(GoalWire, Option<Arc<CodexThread>>, ExternalGoalSet), Error> {
+    ) -> Result<(GoalWire, GoalSetOutcome), Error> {
         self.ensure_goals_enabled()?;
         let ctx = self.goal_thread_context(&params.session_id).await?;
         self.reconcile_goal_rollout(&ctx).await;
 
-        let objective = params.objective.as_deref().map(str::trim);
-        if let Some(objective) = objective {
-            validate_thread_goal_objective(objective)
-                .map_err(|e| Error::invalid_params().data(e))?;
-        }
-        if objective.is_some() || params.token_budget.is_some() {
-            validate_goal_budget(params.token_budget.flatten())
-                .map_err(|e| Error::invalid_params().data(e))?;
-        }
-
-        if let Some(thread) = ctx.running_thread.as_ref() {
-            thread.prepare_external_goal_mutation().await;
-        }
-
-        let status = params.status.map(GoalSetStatusParam::to_state);
-        let thread_id = ctx.thread_id;
-        let goals = ctx.state_db.thread_goals();
-
-        let (goal, previous_status) = if let Some(objective) = objective {
-            let existing = goals
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|e| Error::invalid_params().data(e.to_string()))?;
-            match existing {
-                Some(existing) => {
-                    let previous_status = ExternalGoalPreviousStatus::from(&existing);
-                    let updated = goals
-                        .update_thread_goal(
-                            thread_id,
-                            codex_state::GoalUpdate {
-                                objective: Some(objective.to_string()),
-                                status,
-                                token_budget: params.token_budget,
-                                expected_goal_id: Some(existing.goal_id.clone()),
-                            },
-                        )
-                        .await
-                        .map_err(|e| Error::invalid_params().data(e.to_string()))?
-                        .ok_or_else(|| goal_missing_error(thread_id))?;
-                    (updated, previous_status)
-                }
-                None => {
-                    let created = goals
-                        .replace_thread_goal(
-                            thread_id,
-                            objective,
-                            status.unwrap_or(codex_state::ThreadGoalStatus::Active),
-                            params.token_budget.flatten(),
-                        )
-                        .await
-                        .map_err(|e| Error::invalid_params().data(e.to_string()))?;
-                    (created, ExternalGoalPreviousStatus::NewGoal)
-                }
-            }
-        } else {
-            let existing = goals
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|e| Error::invalid_params().data(e.to_string()))?
-                .ok_or_else(|| goal_missing_error(thread_id))?;
-            let previous_status = ExternalGoalPreviousStatus::from(&existing);
-            let updated = goals
-                .update_thread_goal(
-                    thread_id,
-                    codex_state::GoalUpdate {
-                        objective: None,
-                        status,
-                        token_budget: params.token_budget,
-                        expected_goal_id: None,
-                    },
-                )
-                .await
-                .map_err(|e| Error::invalid_params().data(e.to_string()))?
-                .ok_or_else(|| goal_missing_error(thread_id))?;
-            (updated, previous_status)
+        let status = params.status.map(|status| match status {
+            GoalSetStatusParam::Active => codex_protocol::protocol::ThreadGoalStatus::Active,
+            GoalSetStatusParam::Paused => codex_protocol::protocol::ThreadGoalStatus::Paused,
+        });
+        let objective = match params.objective.as_deref() {
+            Some(objective) => GoalObjectiveUpdate::Set(objective),
+            None => GoalObjectiveUpdate::Keep,
+        };
+        // `token_budget` is a double option on the wire: absent = keep, present
+        // `null` = clear, present number = set. Map it onto the service enum.
+        let token_budget = match params.token_budget {
+            Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
+            None => GoalTokenBudgetUpdate::Keep,
         };
 
-        if objective.is_some() {
-            if let Err(e) = ctx
-                .state_db
-                .set_thread_preview_if_empty(thread_id, goal.objective.as_str())
+        let outcome = self
+            .goal_service
+            .set_thread_goal(
+                &ctx.state_db,
+                GoalSetRequest {
+                    thread_id: ctx.thread_id,
+                    objective,
+                    status,
+                    token_budget,
+                },
+            )
+            .await
+            .map_err(goal_service_error)?;
+
+        // Live goal-first threads can be listed before any user turn is
+        // written; persist the goal update through the live thread so its
+        // JSONL rollout and SQLite preview metadata stay in sync (mirrors the
+        // app-server backend).
+        if let Ok(thread) = self.thread_manager.get_thread(ctx.thread_id).await {
+            if let Err(err) = thread
+                .append_rollout_items(&[outcome.thread_goal_updated_item()])
                 .await
             {
                 tracing::warn!(
-                    "failed to set empty thread preview from goal objective for {thread_id}: {e}"
+                    "failed to persist goal update for live thread {}: {err}",
+                    ctx.thread_id
                 );
             }
         }
 
-        let external_set = ExternalGoalSet {
-            goal: goal.clone(),
-            previous_status,
-        };
-        Ok((GoalWire::from_state(&goal), ctx.running_thread, external_set))
+        let goal_wire = GoalWire::from_protocol(&outcome.goal);
+        Ok((goal_wire, outcome))
     }
 
     async fn goal_get(&self, params: GoalSessionParams) -> Result<serde_json::Value, Error> {
         self.ensure_goals_enabled()?;
         let ctx = self.goal_thread_context(&params.session_id).await?;
-        let goal = ctx
-            .state_db
-            .thread_goals()
-            .get_thread_goal(ctx.thread_id)
+        let goal = self
+            .goal_service
+            .get_thread_goal(&ctx.state_db, ctx.thread_id)
             .await
-            .map_err(|e| {
-                Error::internal_error().data(format!("failed to read thread goal: {e}"))
-            })?;
-        Ok(json!({ "goal": goal.as_ref().map(GoalWire::from_state) }))
+            .map_err(goal_service_error)?;
+        Ok(json!({ "goal": goal.as_ref().map(GoalWire::from_protocol) }))
     }
 
-    async fn goal_clear(
-        &self,
-        params: GoalSessionParams,
-    ) -> Result<(bool, Option<Arc<CodexThread>>), Error> {
+    async fn goal_clear(&self, params: GoalSessionParams) -> Result<bool, Error> {
         self.ensure_goals_enabled()?;
         let ctx = self.goal_thread_context(&params.session_id).await?;
         self.reconcile_goal_rollout(&ctx).await;
-
-        if let Some(thread) = ctx.running_thread.as_ref() {
-            thread.prepare_external_goal_mutation().await;
-        }
-
-        let cleared = ctx
-            .state_db
-            .thread_goals()
-            .delete_thread_goal(ctx.thread_id)
+        self.goal_service
+            .clear_thread_goal(&ctx.state_db, ctx.thread_id)
             .await
-            .map_err(|e| {
-                Error::internal_error().data(format!("failed to clear thread goal: {e}"))
-            })?;
-        Ok((cleared, ctx.running_thread))
+            .map_err(goal_service_error)
     }
 
     fn ensure_goals_enabled(&self) -> Result<(), Error> {
@@ -1153,7 +1129,6 @@ impl CodexAgent {
             thread_id,
             state_db,
             rollout_path,
-            running_thread,
         })
     }
 
@@ -1185,19 +1160,42 @@ impl CodexAgent {
     }
 }
 
-fn goal_missing_error(thread_id: ThreadId) -> Error {
-    Error::invalid_params().data(format!(
-        "cannot update goal for thread {thread_id}: no goal exists"
-    ))
+/// Build the extension registry codex-acp installs on its `ThreadManager`.
+///
+/// Only the native goal extension is installed: on thread start it registers a
+/// per-thread `GoalRuntimeHandle` in `goal_service`, drives the
+/// idle-continuation loop, and emits `ThreadGoalUpdated` events through the
+/// event sink (routed to the owning session's ACP client via `goal_registry`).
+/// When no state db is available goals cannot be persisted, so the extension is
+/// left uninstalled (the ext methods then fail with a clear error).
+fn build_goal_extension_registry(
+    state_db: Option<StateDbHandle>,
+    thread_manager: Weak<ThreadManager>,
+    goal_service: Arc<GoalService>,
+    goal_registry: GoalNotificationRegistry,
+) -> Arc<ExtensionRegistry<Config>> {
+    let event_sink: Arc<dyn ExtensionEventSink> =
+        Arc::new(GoalExtensionEventSink::new(goal_registry));
+    let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(event_sink);
+    if let Some(state_db) = state_db {
+        codex_goal_extension::install_with_backend(
+            &mut builder,
+            state_db,
+            AnalyticsEventsClient::disabled(),
+            /*metrics_client*/ None,
+            thread_manager,
+            goal_service,
+            |config: &Config| config.features.enabled(Feature::Goals),
+        );
+    }
+    Arc::new(builder.build())
 }
 
-fn validate_goal_budget(value: Option<i64>) -> Result<(), String> {
-    if let Some(value) = value {
-        if value <= 0 {
-            return Err("goal budgets must be positive when provided".to_string());
-        }
+fn goal_service_error(err: GoalServiceError) -> Error {
+    match err {
+        GoalServiceError::InvalidRequest(message) => Error::invalid_params().data(message),
+        GoalServiceError::Internal(message) => Error::internal_error().data(message),
     }
-    Ok(())
 }
 
 fn respond_json(responder: Responder<serde_json::Value>, value: serde_json::Value) {

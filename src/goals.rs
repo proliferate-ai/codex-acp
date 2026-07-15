@@ -62,18 +62,6 @@ pub(crate) struct GoalWire {
 }
 
 /// (normalized status, verbatim native status) for a codex goal status.
-fn normalize_state_status(status: codex_state::ThreadGoalStatus) -> (&'static str, &'static str) {
-    use codex_state::ThreadGoalStatus as S;
-    match status {
-        S::Active => (GOAL_STATUS_ACTIVE, "active"),
-        S::Paused => (GOAL_STATUS_PAUSED, "paused"),
-        S::Blocked => (GOAL_STATUS_BLOCKED, "blocked"),
-        S::UsageLimited => (GOAL_STATUS_FAILED, "usageLimited"),
-        S::BudgetLimited => (GOAL_STATUS_FAILED, "budgetLimited"),
-        S::Complete => (GOAL_STATUS_MET, "complete"),
-    }
-}
-
 fn normalize_protocol_status(
     status: codex_protocol::protocol::ThreadGoalStatus,
 ) -> (&'static str, &'static str) {
@@ -89,25 +77,9 @@ fn normalize_protocol_status(
 }
 
 impl GoalWire {
-    /// Build from a state-db goal row (ext-method path).
-    pub(crate) fn from_state(goal: &codex_state::ThreadGoal) -> Self {
-        let (status, native_status) = normalize_state_status(goal.status);
-        Self {
-            objective: goal.objective.clone(),
-            status,
-            native_status,
-            token_budget: goal.token_budget,
-            tokens_used: Some(goal.tokens_used),
-            time_used_seconds: Some(goal.time_used_seconds),
-            met_reason: None,
-            iterations: None,
-            native: true,
-            updated_at_ms: goal.updated_at.timestamp_millis(),
-        }
-    }
-
-    /// Build from a protocol goal (EventMsg::ThreadGoalUpdated path). Protocol
-    /// timestamps are epoch seconds.
+    /// Build from a protocol goal. Used both on the `ThreadGoalUpdated` event
+    /// path and for the `GoalService` ext-method results (which return a
+    /// protocol `ThreadGoal`). Protocol timestamps are epoch seconds.
     pub(crate) fn from_protocol(goal: &codex_protocol::protocol::ThreadGoal) -> Self {
         let (status, native_status) = normalize_protocol_status(goal.status);
         Self {
@@ -175,15 +147,6 @@ pub(crate) fn initialize_capability_meta() -> Meta {
 pub(crate) enum GoalSetStatusParam {
     Active,
     Paused,
-}
-
-impl GoalSetStatusParam {
-    pub(crate) fn to_state(self) -> codex_state::ThreadGoalStatus {
-        match self {
-            GoalSetStatusParam::Active => codex_state::ThreadGoalStatus::Active,
-            GoalSetStatusParam::Paused => codex_state::ThreadGoalStatus::Paused,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,19 +246,19 @@ mod tests {
 
     #[test]
     fn status_normalization_matches_contract() {
-        use codex_state::ThreadGoalStatus as S;
-        assert_eq!(normalize_state_status(S::Active), ("active", "active"));
-        assert_eq!(normalize_state_status(S::Paused), ("paused", "paused"));
-        assert_eq!(normalize_state_status(S::Blocked), ("blocked", "blocked"));
+        use codex_protocol::protocol::ThreadGoalStatus as S;
+        assert_eq!(normalize_protocol_status(S::Active), ("active", "active"));
+        assert_eq!(normalize_protocol_status(S::Paused), ("paused", "paused"));
+        assert_eq!(normalize_protocol_status(S::Blocked), ("blocked", "blocked"));
         assert_eq!(
-            normalize_state_status(S::UsageLimited),
+            normalize_protocol_status(S::UsageLimited),
             ("failed", "usageLimited")
         );
         assert_eq!(
-            normalize_state_status(S::BudgetLimited),
+            normalize_protocol_status(S::BudgetLimited),
             ("failed", "budgetLimited")
         );
-        assert_eq!(normalize_state_status(S::Complete), ("met", "complete"));
+        assert_eq!(normalize_protocol_status(S::Complete), ("met", "complete"));
     }
 
     #[test]

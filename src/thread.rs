@@ -32,6 +32,7 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_prompts::user_facing_hint,
 };
+use codex_extension_api::ExtensionEventSink;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -505,6 +506,61 @@ enum ThreadMessage {
     },
 }
 
+/// Process-wide map from a session id to the live ACP client for that session.
+///
+/// At codex core rust-v0.144.1 goals became an installed extension whose
+/// `ThreadGoalUpdated` events are delivered through the host
+/// [`ExtensionEventSink`] instead of the thread's own event stream. codex-acp
+/// registers every session's [`SessionClient`] here so the goal event sink can
+/// route those updates back to the owning session's connection.
+#[derive(Clone, Default)]
+pub struct GoalNotificationRegistry {
+    clients: Arc<Mutex<HashMap<SessionId, SessionClient>>>,
+}
+
+impl GoalNotificationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(&self, session_id: SessionId, client: SessionClient) {
+        self.clients.lock().unwrap().insert(session_id, client);
+    }
+
+    fn unregister(&self, session_id: &SessionId) {
+        self.clients.lock().unwrap().remove(session_id);
+    }
+
+    fn client_for(&self, session_id: &SessionId) -> Option<SessionClient> {
+        self.clients.lock().unwrap().get(session_id).cloned()
+    }
+}
+
+/// [`ExtensionEventSink`] that forwards goal-engine `ThreadGoalUpdated` events
+/// to the owning session's ACP client as tagged goal chunks, matching the
+/// shape the anyharness runtime consumes. Non-goal extension events are
+/// dropped (codex-acp does not surface other extension-emitted events).
+pub struct GoalExtensionEventSink {
+    registry: GoalNotificationRegistry,
+}
+
+impl GoalExtensionEventSink {
+    pub fn new(registry: GoalNotificationRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+impl ExtensionEventSink for GoalExtensionEventSink {
+    fn emit(&self, event: Event) {
+        if let EventMsg::ThreadGoalUpdated(goal_event) = event.msg {
+            let session_id = SessionId::new(goal_event.goal.thread_id.to_string());
+            if let Some(client) = self.registry.client_for(&session_id) {
+                client.send_goal_transcript_event(&goal_event.goal);
+            }
+        }
+    }
+}
+
 pub struct Thread {
     /// Direct handle to the underlying Codex thread for out-of-band shutdown.
     thread: Arc<dyn CodexThreadImpl>,
@@ -512,6 +568,16 @@ pub struct Thread {
     message_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// Keep the actor task alive for the lifetime of the thread wrapper.
     _handle: tokio::task::JoinHandle<()>,
+    /// Registry to deregister this session's goal-notification client on drop.
+    goal_registry: GoalNotificationRegistry,
+    /// Session id used to deregister from `goal_registry` on drop.
+    session_id: SessionId,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        self.goal_registry.unregister(&self.session_id);
+    }
 }
 
 impl Thread {
@@ -523,13 +589,19 @@ impl Thread {
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
+        goal_registry: GoalNotificationRegistry,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
 
+        let session_client = SessionClient::new(session_id.clone(), cx, client_capabilities);
+        // Register the client so the goal extension's event sink can deliver
+        // `ThreadGoalUpdated` notifications to this session.
+        goal_registry.register(session_id.clone(), session_client.clone());
+
         let actor = ThreadActor::new(
             auth,
-            SessionClient::new(session_id, cx, client_capabilities),
+            session_client,
             thread.clone(),
             models_manager,
             config,
@@ -543,6 +615,8 @@ impl Thread {
             thread,
             message_tx,
             _handle: handle,
+            goal_registry,
+            session_id,
         }
     }
 
@@ -5267,6 +5341,7 @@ mod tests {
                 call_id: "call-id".to_string(),
                 approval_id: Some("approval-id".to_string()),
                 turn_id: turn_id.clone(),
+                environment_id: None,
                 started_at_ms: 0,
                 command: vec!["echo".to_string(), "hi".to_string()],
                 cwd: std::env::current_dir().unwrap().try_into().unwrap(),
@@ -7111,6 +7186,8 @@ mod tests {
             thread: conversation.clone(),
             message_tx,
             _handle: handle,
+            goal_registry: GoalNotificationRegistry::new(),
+            session_id: session_id.clone(),
         };
 
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();

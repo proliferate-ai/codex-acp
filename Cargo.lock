@@ -1784,17 +1784,21 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "clap",
+ "codex-analytics",
  "codex-apply-patch",
  "codex-arg0",
  "codex-config",
  "codex-core",
  "codex-exec-server",
  "codex-extension-api",
+ "codex-features",
+ "codex-goal-extension",
  "codex-home",
  "codex-login",
  "codex-mcp-server",
  "codex-models-manager",
  "codex-protocol",
+ "codex-rollout",
  "codex-shell-command",
  "codex-thread-store",
  "codex-utils-approval-presets",
@@ -2457,6 +2461,25 @@ dependencies = [
  "tokio",
  "ts-rs",
  "walkdir",
+]
+
+[[package]]
+name = "codex-goal-extension"
+version = "0.144.1"
+source = "git+https://github.com/openai/codex?tag=rust-v0.144.1#44918ea10c0f99151c6710411b4322c2f5c96bea"
+dependencies = [
+ "codex-analytics",
+ "codex-core",
+ "codex-extension-api",
+ "codex-otel",
+ "codex-protocol",
+ "codex-state",
+ "codex-tools",
+ "codex-utils-template",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
