@@ -515,7 +515,8 @@ enum ThreadMessage {
 /// route those updates back to the owning session's connection.
 #[derive(Clone, Default)]
 pub struct GoalNotificationRegistry {
-    clients: Arc<Mutex<HashMap<SessionId, SessionClient>>>,
+    clients: Arc<Mutex<HashMap<SessionId, (u64, SessionClient)>>>,
+    next_token: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl GoalNotificationRegistry {
@@ -523,16 +524,39 @@ impl GoalNotificationRegistry {
         Self::default()
     }
 
-    fn register(&self, session_id: SessionId, client: SessionClient) {
-        self.clients.lock().unwrap().insert(session_id, client);
+    /// Registers (or replaces) the session's client and returns a token that
+    /// identifies THIS registration. `unregister` requires the token so a
+    /// superseded thread's Drop cannot remove its replacement: re-loading an
+    /// already-open session registers the new client first, then the map
+    /// insert drops the evicted thread — an unconditional remove there would
+    /// silently unroute all subsequent goal events for the session.
+    fn register(&self, session_id: SessionId, client: SessionClient) -> u64 {
+        let token = self
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(session_id, (token, client));
+        token
     }
 
-    fn unregister(&self, session_id: &SessionId) {
-        self.clients.lock().unwrap().remove(session_id);
+    fn unregister(&self, session_id: &SessionId, token: u64) {
+        let mut clients = self.clients.lock().unwrap();
+        if clients
+            .get(session_id)
+            .is_some_and(|(current, _)| *current == token)
+        {
+            clients.remove(session_id);
+        }
     }
 
     fn client_for(&self, session_id: &SessionId) -> Option<SessionClient> {
-        self.clients.lock().unwrap().get(session_id).cloned()
+        self.clients
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|(_, client)| client.clone())
     }
 }
 
@@ -572,11 +596,15 @@ pub struct Thread {
     goal_registry: GoalNotificationRegistry,
     /// Session id used to deregister from `goal_registry` on drop.
     session_id: SessionId,
+    /// Identifies this thread's registration in `goal_registry`; Drop only
+    /// removes the entry when it still owns it (see `register`).
+    goal_registry_token: u64,
 }
 
 impl Drop for Thread {
     fn drop(&mut self) {
-        self.goal_registry.unregister(&self.session_id);
+        self.goal_registry
+            .unregister(&self.session_id, self.goal_registry_token);
     }
 }
 
@@ -597,7 +625,8 @@ impl Thread {
         let session_client = SessionClient::new(session_id.clone(), cx, client_capabilities);
         // Register the client so the goal extension's event sink can deliver
         // `ThreadGoalUpdated` notifications to this session.
-        goal_registry.register(session_id.clone(), session_client.clone());
+        let goal_registry_token =
+            goal_registry.register(session_id.clone(), session_client.clone());
 
         let actor = ThreadActor::new(
             auth,
@@ -617,6 +646,7 @@ impl Thread {
             _handle: handle,
             goal_registry,
             session_id,
+            goal_registry_token,
         }
     }
 
@@ -6110,6 +6140,35 @@ mod tests {
         }
     }
 
+    /// Re-loading an already-open session registers the new client, then the
+    /// sessions-map insert drops the evicted thread. The superseded thread's
+    /// cleanup must not remove the replacement registration, or every
+    /// subsequent goal event for the session is silently dropped.
+    #[test]
+    fn goal_registry_drop_of_superseded_registration_keeps_replacement() {
+        let registry = GoalNotificationRegistry::new();
+        let session_id = SessionId::new("test");
+        let client_a = SessionClient::with_client(
+            session_id.clone(),
+            Arc::new(StubClient::new()),
+            Arc::default(),
+        );
+        let client_b = SessionClient::with_client(
+            session_id.clone(),
+            Arc::new(StubClient::new()),
+            Arc::default(),
+        );
+        let token_a = registry.register(session_id.clone(), client_a);
+        let token_b = registry.register(session_id.clone(), client_b);
+        registry.unregister(&session_id, token_a);
+        assert!(
+            registry.client_for(&session_id).is_some(),
+            "superseded drop removed the live registration"
+        );
+        registry.unregister(&session_id, token_b);
+        assert!(registry.client_for(&session_id).is_none());
+    }
+
     async fn setup() -> anyhow::Result<(
         SessionId,
         Arc<StubClient>,
@@ -7188,6 +7247,7 @@ mod tests {
             _handle: handle,
             goal_registry: GoalNotificationRegistry::new(),
             session_id: session_id.clone(),
+            goal_registry_token: 0,
         };
 
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
