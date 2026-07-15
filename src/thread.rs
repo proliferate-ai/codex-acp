@@ -1332,6 +1332,9 @@ struct PromptState {
     agent_message_ids_by_item_id: HashMap<String, String>,
     /// Stable message_id for transient-status chunks within one turn; reset on turn start/complete.
     transient_status_message_id: Option<String>,
+    /// Native child thread -> stable spawn tool-call id. Used to nest child
+    /// activity under the same durable parent in live and replay streams.
+    subagent_call_ids_by_thread: HashMap<codex_protocol::ThreadId, String>,
 }
 
 impl PromptState {
@@ -1357,6 +1360,7 @@ impl PromptState {
             seen_reasoning_deltas: false,
             agent_message_ids_by_item_id: HashMap::new(),
             transient_status_message_id: None,
+            subagent_call_ids_by_thread: HashMap::new(),
         }
     }
 
@@ -1603,6 +1607,10 @@ impl PromptState {
                 self.complete_web_search(client);
             }
             _ => {}
+        }
+
+        if normalize_native_subagent_event(client, &mut self.subagent_call_ids_by_thread, &event) {
+            return;
         }
 
         match event {
@@ -2003,25 +2011,25 @@ impl PromptState {
             // Old events
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
-            // TODO: Subagent UI?
-            | EventMsg::CollabAgentSpawnBegin(..)
-            | EventMsg::CollabAgentSpawnEnd(..)
-            | EventMsg::CollabAgentInteractionBegin(..)
-            | EventMsg::CollabAgentInteractionEnd(..)
             | EventMsg::RealtimeConversationStarted(..)
             | EventMsg::RealtimeConversationRealtime(..)
             | EventMsg::RealtimeConversationClosed(..)
             | EventMsg::RealtimeConversationSdp(..)
-            | EventMsg::CollabWaitingBegin(..)
-            | EventMsg::CollabWaitingEnd(..)
-            | EventMsg::CollabResumeBegin(..)
-            | EventMsg::CollabResumeEnd(..)
-            | EventMsg::CollabCloseBegin(..)
-            | EventMsg::CollabCloseEnd(..)
             | EventMsg::PlanDelta(..)
             | EventMsg::TurnModerationMetadata(..)
             | EventMsg::SafetyBuffering(..)
-            | EventMsg::SubAgentActivity(..) => {}
+            // Normalized above into stable parent/nested ACP tool calls.
+            | EventMsg::CollabAgentSpawnBegin(..)
+            | EventMsg::CollabAgentSpawnEnd(..)
+            | EventMsg::CollabAgentInteractionBegin(..)
+            | EventMsg::CollabAgentInteractionEnd(..)
+            | EventMsg::CollabWaitingBegin(..)
+            | EventMsg::CollabWaitingEnd(..)
+            | EventMsg::SubAgentActivity(..)
+            | EventMsg::CollabResumeBegin(..)
+            | EventMsg::CollabResumeEnd(..)
+            | EventMsg::CollabCloseBegin(..)
+            | EventMsg::CollabCloseEnd(..) => {}
             e @ EventMsg::RealtimeConversationListVoicesResponse(..) => {
                 warn!("Unexpected event: {:?}", e);
             }
@@ -3603,6 +3611,8 @@ struct ThreadActor<A> {
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// Collaboration preset applied independently of the approval/sandbox mode.
     active_collaboration_mask: Option<CollaborationModeMask>,
+    /// Replay-side copy of the native child -> spawn identity map.
+    subagent_call_ids_by_thread: HashMap<codex_protocol::ThreadId, String>,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -3630,6 +3640,7 @@ impl<A: Auth> ThreadActor<A> {
             resolution_rx,
             last_sent_config_options: None,
             active_collaboration_mask,
+            subagent_call_ids_by_thread: HashMap::new(),
         }
     }
 
@@ -4390,6 +4401,10 @@ impl<A: Auth> ThreadActor<A> {
     /// Convert and send an EventMsg as ACP notification(s) during replay.
     /// Handles messages and reasoning - mirrors the live event handling in PromptState.
     fn replay_event_msg(&mut self, msg: &EventMsg) {
+        if normalize_native_subagent_event(&self.client, &mut self.subagent_call_ids_by_thread, msg)
+        {
+            return;
+        }
         match msg {
             EventMsg::TurnStarted(TurnStartedEvent {
                 collaboration_mode_kind,
@@ -5166,6 +5181,252 @@ fn image_generation_content(
 /// Generate a fallback ID using UUID (used when id is missing)
 fn generate_fallback_id(prefix: &str) -> String {
     format!("{}_{}", prefix, Uuid::new_v4())
+}
+
+fn native_subagent_meta(native_tool_name: &str, parent_tool_call_id: Option<&str>) -> Meta {
+    let mut anyharness = json!({
+        "nativeToolName": native_tool_name,
+        "toolKind": "subagent",
+    });
+    if let Some(parent_tool_call_id) = parent_tool_call_id {
+        anyharness["parentToolCallId"] = json!(parent_tool_call_id);
+    }
+    Meta::from_iter([(ANYHARNESS_META_KEY.to_string(), anyharness)])
+}
+
+fn native_agent_status(status: &codex_protocol::protocol::AgentStatus) -> ToolCallStatus {
+    use codex_protocol::protocol::AgentStatus;
+    match status {
+        AgentStatus::Errored(_) | AgentStatus::Interrupted | AgentStatus::NotFound => {
+            ToolCallStatus::Failed
+        }
+        AgentStatus::Completed(_) | AgentStatus::Shutdown => ToolCallStatus::Completed,
+        AgentStatus::PendingInit | AgentStatus::Running => {
+            ToolCallStatus::InProgress
+        }
+    }
+}
+
+fn native_operation_status(status: &codex_protocol::protocol::AgentStatus) -> ToolCallStatus {
+    use codex_protocol::protocol::AgentStatus;
+    match status {
+        AgentStatus::Errored(_) | AgentStatus::Interrupted | AgentStatus::NotFound => {
+            ToolCallStatus::Failed
+        }
+        _ => ToolCallStatus::Completed,
+    }
+}
+
+/// Normalize Codex's native collaboration protocol at the adapter boundary.
+/// The parent spawn remains one stable ACP tool call; interaction/activity
+/// events are nested beneath it through provider-neutral anyharness metadata.
+/// Returning true means the event was fully handled and must not also enter the
+/// parent-agent transcript path.
+fn normalize_native_subagent_event(
+    client: &SessionClient,
+    parents: &mut HashMap<codex_protocol::ThreadId, String>,
+    event: &EventMsg,
+) -> bool {
+    match event {
+        EventMsg::CollabAgentSpawnBegin(event) => {
+            client.send_tool_call(
+                ToolCall::new(event.call_id.clone(), "Spawn subagent")
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(json!({
+                        "prompt": event.prompt,
+                        "model": event.model,
+                        "reasoningEffort": event.reasoning_effort,
+                    }))
+                    .meta(native_subagent_meta("Agent", None)),
+            );
+        }
+        EventMsg::CollabAgentSpawnEnd(event) => {
+            if let Some(thread_id) = event.new_thread_id {
+                parents.insert(thread_id, event.call_id.clone());
+            }
+            let status = event
+                .new_thread_id
+                .map(|_| native_agent_status(&event.status))
+                .unwrap_or(ToolCallStatus::Failed);
+            client.send_tool_call_update(
+                ToolCallUpdate::new(
+                    event.call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .status(status)
+                        .title(
+                            event
+                                .new_agent_nickname
+                                .clone()
+                                .or_else(|| event.new_agent_role.clone())
+                                .unwrap_or_else(|| "Subagent".to_string()),
+                        )
+                        .raw_output(serde_json::to_value(event).ok()),
+                )
+                .meta(native_subagent_meta("Agent", None)),
+            );
+        }
+        EventMsg::CollabAgentInteractionBegin(event) => {
+            let parent = parents.get(&event.receiver_thread_id).map(String::as_str);
+            client.send_tool_call(
+                ToolCall::new(event.call_id.clone(), "Message subagent")
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(json!({
+                        "subagentId": event.receiver_thread_id,
+                        "prompt": event.prompt,
+                    }))
+                    .meta(native_subagent_meta("send_input", parent)),
+            );
+        }
+        EventMsg::CollabAgentInteractionEnd(event) => {
+            let parent = parents.get(&event.receiver_thread_id).map(String::as_str);
+            client.send_tool_call_update(
+                ToolCallUpdate::new(
+                    event.call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .status(native_operation_status(&event.status))
+                        .raw_output(serde_json::to_value(event).ok()),
+                )
+                .meta(native_subagent_meta("send_input", parent)),
+            );
+        }
+        EventMsg::CollabWaitingBegin(event) => {
+            let parent = event
+                .receiver_thread_ids
+                .first()
+                .and_then(|thread_id| parents.get(thread_id))
+                .map(String::as_str);
+            client.send_tool_call(
+                ToolCall::new(event.call_id.clone(), "Wait for subagent")
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::to_value(event).ok())
+                    .meta(native_subagent_meta("wait", parent)),
+            );
+        }
+        EventMsg::CollabWaitingEnd(event) => {
+            let failed = event
+                .statuses
+                .values()
+                .any(|status| native_operation_status(status) == ToolCallStatus::Failed);
+            let parent = event
+                .statuses
+                .keys()
+                .next()
+                .and_then(|thread_id| parents.get(thread_id))
+                .map(String::as_str);
+            client.send_tool_call_update(
+                ToolCallUpdate::new(
+                    event.call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .status(if failed {
+                            ToolCallStatus::Failed
+                        } else {
+                            ToolCallStatus::Completed
+                        })
+                        .raw_output(serde_json::to_value(event).ok()),
+                )
+                .meta(native_subagent_meta("wait", parent)),
+            );
+            for (thread_id, status) in &event.statuses {
+                if let Some(parent_call_id) = parents.get(thread_id) {
+                    client.send_tool_call_update(
+                        ToolCallUpdate::new(
+                            parent_call_id.clone(),
+                            ToolCallUpdateFields::new()
+                                .status(native_agent_status(status))
+                                .raw_output(json!({
+                                    "subagentId": thread_id,
+                                    "status": status,
+                                })),
+                        )
+                        .meta(native_subagent_meta("Agent", None)),
+                    );
+                }
+            }
+        }
+        EventMsg::SubAgentActivity(event) => {
+            use codex_protocol::protocol::SubAgentActivityKind;
+            let parent = parents.get(&event.agent_thread_id).map(String::as_str);
+            let (title, status) = match event.kind {
+                SubAgentActivityKind::Started => ("Subagent started", ToolCallStatus::Completed),
+                SubAgentActivityKind::Interacted => {
+                    ("Subagent progressed", ToolCallStatus::Completed)
+                }
+                SubAgentActivityKind::Interrupted => {
+                    ("Subagent interrupted", ToolCallStatus::Failed)
+                }
+            };
+            client.send_tool_call(
+                ToolCall::new(event.event_id.clone(), title)
+                    .kind(ToolKind::Think)
+                    .status(status)
+                    .raw_output(serde_json::to_value(event).ok())
+                    .meta(native_subagent_meta("subagent_activity", parent)),
+            );
+        }
+        EventMsg::CollabResumeBegin(event) => {
+            let parent = parents.get(&event.receiver_thread_id).map(String::as_str);
+            client.send_tool_call(
+                ToolCall::new(event.call_id.clone(), "Resume subagent")
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::to_value(event).ok())
+                    .meta(native_subagent_meta("resume_agent", parent)),
+            );
+        }
+        EventMsg::CollabResumeEnd(event) => {
+            let parent = parents.get(&event.receiver_thread_id).map(String::as_str);
+            client.send_tool_call_update(
+                ToolCallUpdate::new(
+                    event.call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .status(native_operation_status(&event.status))
+                        .raw_output(serde_json::to_value(event).ok()),
+                )
+                .meta(native_subagent_meta("resume_agent", parent)),
+            );
+        }
+        EventMsg::CollabCloseBegin(event) => {
+            let parent = parents.get(&event.receiver_thread_id).map(String::as_str);
+            client.send_tool_call(
+                ToolCall::new(event.call_id.clone(), "Close subagent")
+                    .kind(ToolKind::Think)
+                    .status(ToolCallStatus::InProgress)
+                    .raw_input(serde_json::to_value(event).ok())
+                    .meta(native_subagent_meta("close_agent", parent)),
+            );
+        }
+        EventMsg::CollabCloseEnd(event) => {
+            let parent = parents.get(&event.receiver_thread_id).map(String::as_str);
+            client.send_tool_call_update(
+                ToolCallUpdate::new(
+                    event.call_id.clone(),
+                    ToolCallUpdateFields::new()
+                        .status(native_operation_status(&event.status))
+                        .raw_output(serde_json::to_value(event).ok()),
+                )
+                .meta(native_subagent_meta("close_agent", parent)),
+            );
+            if let Some(parent_call_id) = parents.get(&event.receiver_thread_id) {
+                client.send_tool_call_update(
+                    ToolCallUpdate::new(
+                        parent_call_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(native_agent_status(&event.status))
+                            .raw_output(json!({
+                                "subagentId": event.receiver_thread_id,
+                                "status": event.status,
+                            })),
+                    )
+                    .meta(native_subagent_meta("Agent", None)),
+                );
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Checks if a prompt is slash command
@@ -6711,6 +6972,119 @@ mod tests {
                 Err(Error::internal_error().data("ext_method not supported in StubClient"))
             })
         }
+    }
+
+    #[test]
+    fn native_subagent_events_keep_stable_parent_and_nested_activity() -> anyhow::Result<()> {
+        use codex_protocol::AgentPath;
+        use codex_protocol::protocol::{
+            AgentStatus, CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent,
+            CollabWaitingEndEvent, SubAgentActivityEvent, SubAgentActivityKind,
+        };
+
+        let client = Arc::new(StubClient::new());
+        let session_client =
+            SessionClient::with_client(SessionId::new("test"), client.clone(), Arc::default());
+        let sender_thread_id = ThreadId::default();
+        let child_thread_id = ThreadId::default();
+        let mut parents = HashMap::new();
+
+        assert!(normalize_native_subagent_event(
+            &session_client,
+            &mut parents,
+            &EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                call_id: "spawn-1".to_string(),
+                started_at_ms: 1,
+                sender_thread_id,
+                prompt: "Inspect README.md".to_string(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: Default::default(),
+            }),
+        ));
+        assert!(normalize_native_subagent_event(
+            &session_client,
+            &mut parents,
+            &EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id: "spawn-1".to_string(),
+                completed_at_ms: 2,
+                sender_thread_id,
+                new_thread_id: Some(child_thread_id),
+                new_agent_nickname: Some("reader".to_string()),
+                new_agent_role: Some("explorer".to_string()),
+                prompt: "Inspect README.md".to_string(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: Default::default(),
+                status: AgentStatus::Running,
+            }),
+        ));
+        assert!(normalize_native_subagent_event(
+            &session_client,
+            &mut parents,
+            &EventMsg::SubAgentActivity(SubAgentActivityEvent {
+                event_id: "activity-1".to_string(),
+                occurred_at_ms: 3,
+                agent_thread_id: child_thread_id,
+                agent_path: AgentPath::try_from("/root/reader").map_err(anyhow::Error::msg)?,
+                kind: SubAgentActivityKind::Interacted,
+            }),
+        ));
+        assert!(normalize_native_subagent_event(
+            &session_client,
+            &mut parents,
+            &EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                sender_thread_id,
+                call_id: "wait-1".to_string(),
+                completed_at_ms: 4,
+                agent_statuses: Vec::new(),
+                statuses: [(
+                    child_thread_id,
+                    AgentStatus::Completed(Some("done".to_string()))
+                )]
+                .into_iter()
+                .collect(),
+            }),
+        ));
+
+        let notifications = client.notifications.lock().unwrap();
+        let spawn = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool) if tool.tool_call_id.0.as_ref() == "spawn-1" => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+            .expect("spawn tool call");
+        assert_eq!(spawn.status, ToolCallStatus::InProgress);
+        assert_eq!(
+            spawn.meta.as_ref().unwrap()[ANYHARNESS_META_KEY]["nativeToolName"],
+            "Agent"
+        );
+
+        let activity = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ToolCall(tool) if tool.tool_call_id.0.as_ref() == "activity-1" => {
+                    Some(tool)
+                }
+                _ => None,
+            })
+            .expect("nested activity tool call");
+        assert_eq!(
+            activity.meta.as_ref().unwrap()[ANYHARNESS_META_KEY]["parentToolCallId"],
+            "spawn-1"
+        );
+        assert!(notifications.iter().any(|notification| matches!(
+            &notification.update,
+            SessionUpdate::ToolCallUpdate(update)
+                if update.tool_call_id.0.as_ref() == "spawn-1"
+                    && update.fields.status == Some(ToolCallStatus::Completed)
+        )));
+        assert_eq!(
+            native_agent_status(&AgentStatus::Interrupted),
+            ToolCallStatus::Failed
+        );
+        Ok(())
     }
 
     #[tokio::test]
