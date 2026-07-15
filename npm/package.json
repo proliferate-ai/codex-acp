@@ -1,6 +1,6 @@
 {
   "name": "@proliferate-ai/codex-acp",
-  "version": "0.17.0-proliferate.1",
+  "version": "0.18.0-proliferate.1",
   "type": "module",
   "description": "An ACP-compatible coding agent powered by Codex",
   "license": "Apache-2.0",
@@ -28,11 +28,11 @@
     "bin"
   ],
   "optionalDependencies": {
-    "@proliferate-ai/codex-acp-darwin-arm64": "0.17.0-proliferate.1",
-    "@proliferate-ai/codex-acp-darwin-x64": "0.17.0-proliferate.1",
-    "@proliferate-ai/codex-acp-linux-arm64": "0.17.0-proliferate.1",
-    "@proliferate-ai/codex-acp-linux-x64": "0.17.0-proliferate.1",
-    "@proliferate-ai/codex-acp-win32-arm64": "0.17.0-proliferate.1",
-    "@proliferate-ai/codex-acp-win32-x64": "0.17.0-proliferate.1"
+    "@proliferate-ai/codex-acp-darwin-arm64": "0.18.0-proliferate.1",
+    "@proliferate-ai/codex-acp-darwin-x64": "0.18.0-proliferate.1",
+    "@proliferate-ai/codex-acp-linux-arm64": "0.18.0-proliferate.1",
+    "@proliferate-ai/codex-acp-linux-x64": "0.18.0-proliferate.1",
+    "@proliferate-ai/codex-acp-win32-arm64": "0.18.0-proliferate.1",
+    "@proliferate-ai/codex-acp-win32-x64": "0.18.0-proliferate.1"
   }
 }
