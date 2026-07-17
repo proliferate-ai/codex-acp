@@ -442,7 +442,12 @@ fn native_v2_activity_live_and_paginated_replay_match_without_raw_call_duplicate
             &mut live,
             &live_session,
             EventMsg::RawResponseItem(RawResponseItemEvent {
-                item: response_call(event_id, name, None, arguments.clone()),
+                item: response_call(
+                    event_id,
+                    name,
+                    Some(MULTI_AGENT_V2_NAMESPACE),
+                    arguments.clone(),
+                ),
             }),
         );
         apply_event(
@@ -486,7 +491,7 @@ fn native_v2_activity_live_and_paginated_replay_match_without_raw_call_duplicate
         apply_response(
             &mut replay,
             &replay_session,
-            response_call(event_id, name, None, arguments),
+            response_call(event_id, name, Some(MULTI_AGENT_V2_NAMESPACE), arguments),
         );
         apply_event(
             &mut replay,
@@ -555,7 +560,7 @@ fn native_v2_failed_calls_survive_live_and_paginated_replay_without_success_flag
             response_call(
                 "spawn-seed",
                 "spawn_agent",
-                None,
+                Some(MULTI_AGENT_V2_NAMESPACE),
                 json!({
                     "message": "Inspect README.md",
                     "task_name": "reader",
@@ -602,6 +607,10 @@ fn native_v2_failed_calls_survive_live_and_paginated_replay_without_success_flag
             ),
             live,
         );
+        assert!(state.suppressed_v2_calls.is_empty());
+        assert!(state.suppressed_v2_order.is_empty());
+        assert!(state.early_v2_activities.ids.is_empty());
+        assert!(state.completed_v2_calls.contains("spawn-seed"));
 
         let failures = [
             (
@@ -637,14 +646,23 @@ fn native_v2_failed_calls_survive_live_and_paginated_replay_without_success_flag
             apply_raw(
                 &mut state,
                 &session,
-                response_call(call_id, name, None, arguments),
+                response_call(call_id, name, Some(MULTI_AGENT_V2_NAMESPACE), arguments),
                 live,
             );
             let output = response_text_output_with_success(call_id, error, live.then_some(false));
             apply_raw(&mut state, &session, output.clone(), live);
+            assert!(!state.suppressed_v2_calls.contains_key(call_id));
+            assert!(!state.suppressed_v2_order.iter().any(|id| id == call_id));
+            assert!(!state.early_v2_activities.contains(call_id));
+            assert!(state.completed_v2_calls.contains(call_id));
+            let notice_count = native_notices(&client).len();
+            let tombstone_count = state.completed_v2_calls.ids.len();
             // Duplicate delivery must not create a second logical item/output.
             apply_raw(&mut state, &session, output, live);
+            assert_eq!(native_notices(&client).len(), notice_count);
+            assert_eq!(state.completed_v2_calls.ids.len(), tombstone_count);
         }
+        assert_eq!(state.completed_v2_calls.ids.len(), 5);
 
         native_notices(&client)
     }
@@ -667,6 +685,185 @@ fn native_v2_failed_calls_survive_live_and_paginated_replay_without_success_flag
             "update:interrupt-failed:Failed:close_agent:spawn-seed",
         ]
     );
+}
+
+#[test]
+fn native_v2_only_claims_the_configured_collaboration_namespace() {
+    let (client, session) = native_test_client();
+    let mut state = NativeSubagentState::default();
+    let arguments = json!({
+        "message": "Inspect README.md",
+        "task_name": "reader",
+        "fork_turns": "none",
+    });
+
+    for (call_id, namespace) in [("plain-v2", None), ("foreign-v2", Some("foreign"))] {
+        assert!(!state.handle_response_item(
+            &session,
+            &response_call(call_id, "spawn_agent", namespace, arguments.clone()),
+        ));
+    }
+    assert!(state.suppressed_v2_calls.is_empty());
+    assert!(native_notices(&client).is_empty());
+
+    apply_response(
+        &mut state,
+        &session,
+        v1_call(
+            "legacy-v1",
+            "spawn_agent",
+            json!({"message": "Inspect README.md"}),
+        ),
+    );
+    assert!(state.operations.contains_key("legacy-v1"));
+    assert!(!state.suppressed_v2_calls.contains_key("legacy-v1"));
+
+    apply_response(
+        &mut state,
+        &session,
+        response_call(
+            "collaboration-v2",
+            "spawn_agent",
+            Some(MULTI_AGENT_V2_NAMESPACE),
+            arguments,
+        ),
+    );
+    assert!(state.suppressed_v2_calls.contains_key("collaboration-v2"));
+
+    assert!(!state.handle_response_item(
+        &session,
+        &response_call("plain-wait", "wait_agent", None, json!({})),
+    ));
+    apply_response(
+        &mut state,
+        &session,
+        response_call(
+            "collaboration-wait",
+            "wait_agent",
+            Some(MULTI_AGENT_V2_NAMESPACE),
+            json!({}),
+        ),
+    );
+    assert!(state.operations.contains_key("collaboration-wait"));
+}
+
+#[test]
+fn native_v2_early_activity_marker_is_consumed_and_terminal_state_is_payload_free() {
+    use codex_protocol::AgentPath;
+
+    let sender = fixed_thread_id(1);
+    let child = fixed_thread_id(2);
+    let path = AgentPath::try_from("/root/reader").expect("fixed agent path");
+    let (client, session) = native_test_client();
+    let mut state = NativeSubagentState::default();
+
+    apply_event(
+        &mut state,
+        &session,
+        completed_native_item(
+            sender,
+            TurnItem::SubAgentActivity(SubAgentActivityItem {
+                id: "activity-first".to_string(),
+                kind: SubAgentActivityKind::Started,
+                agent_thread_id: child,
+                agent_path: path,
+            }),
+        ),
+    );
+    assert!(state.early_v2_activities.contains("activity-first"));
+    let notice_count = native_notices(&client).len();
+
+    apply_response(
+        &mut state,
+        &session,
+        response_call(
+            "activity-first",
+            "spawn_agent",
+            Some(MULTI_AGENT_V2_NAMESPACE),
+            json!({
+                "message": "Inspect README.md",
+                "task_name": "reader",
+                "fork_turns": "none",
+            }),
+        ),
+    );
+    assert!(!state.early_v2_activities.contains("activity-first"));
+    assert!(
+        state
+            .suppressed_v2_calls
+            .get("activity-first")
+            .is_some_and(|call| call.canonical_activity)
+    );
+    apply_response(
+        &mut state,
+        &session,
+        response_text_output_with_success("activity-first", "{}", None),
+    );
+
+    assert_eq!(native_notices(&client).len(), notice_count);
+    assert!(state.suppressed_v2_calls.is_empty());
+    assert!(state.suppressed_v2_order.is_empty());
+    assert!(state.early_v2_activities.ids.is_empty());
+    assert!(state.completed_v2_calls.contains("activity-first"));
+}
+
+#[test]
+fn native_v2_pending_orphans_and_id_only_tombstones_are_fifo_bounded() {
+    let (_client, session) = native_test_client();
+    let mut state = NativeSubagentState::default();
+
+    for index in 0..MAX_PENDING_V2_CALLS + 2 {
+        apply_response(
+            &mut state,
+            &session,
+            response_call(
+                &format!("orphan-{index}"),
+                "spawn_agent",
+                Some(MULTI_AGENT_V2_NAMESPACE),
+                json!({
+                    "message": format!("orphan payload {index}"),
+                    "task_name": format!("orphan-{index}"),
+                    "fork_turns": "none",
+                }),
+            ),
+        );
+    }
+
+    assert_eq!(state.suppressed_v2_calls.len(), MAX_PENDING_V2_CALLS);
+    assert_eq!(state.suppressed_v2_order.len(), MAX_PENDING_V2_CALLS);
+    assert_eq!(
+        state.suppressed_v2_order.front().map(String::as_str),
+        Some("orphan-2")
+    );
+    assert!(!state.suppressed_v2_calls.contains_key("orphan-0"));
+    assert!(!state.suppressed_v2_calls.contains_key("orphan-1"));
+    assert!(state.completed_v2_calls.contains("orphan-0"));
+    assert!(state.completed_v2_calls.contains("orphan-1"));
+
+    for index in 0..MAX_EARLY_V2_ACTIVITIES + 2 {
+        state
+            .early_v2_activities
+            .insert(format!("early-{index}"), MAX_EARLY_V2_ACTIVITIES);
+    }
+    assert_eq!(state.early_v2_activities.ids.len(), MAX_EARLY_V2_ACTIVITIES);
+    assert_eq!(
+        state.early_v2_activities.order.front().map(String::as_str),
+        Some("early-2")
+    );
+
+    for index in 0..MAX_COMPLETED_V2_CALLS + 2 {
+        state
+            .completed_v2_calls
+            .insert(format!("completed-{index}"), MAX_COMPLETED_V2_CALLS);
+    }
+    assert_eq!(state.completed_v2_calls.ids.len(), MAX_COMPLETED_V2_CALLS);
+    assert_eq!(
+        state.completed_v2_calls.order.front().map(String::as_str),
+        Some("completed-2")
+    );
+    assert!(!state.completed_v2_calls.contains("orphan-0"));
+    assert!(!state.completed_v2_calls.contains("completed-0"));
+    assert!(!state.completed_v2_calls.contains("completed-1"));
 }
 
 #[test]

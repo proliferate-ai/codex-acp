@@ -13,9 +13,13 @@ use codex_protocol::{
 };
 use itertools::Itertools;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
+const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const MAX_PENDING_V2_CALLS: usize = 64;
+const MAX_EARLY_V2_ACTIVITIES: usize = 256;
+const MAX_COMPLETED_V2_CALLS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeSubagentTool {
@@ -118,6 +122,41 @@ impl SuppressedV2Tool {
 struct SuppressedV2Call {
     tool: SuppressedV2Tool,
     raw_input: Option<Value>,
+    canonical_activity: bool,
+}
+
+#[derive(Default)]
+struct BoundedCallIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl BoundedCallIds {
+    fn contains(&self, call_id: &str) -> bool {
+        self.ids.contains(call_id)
+    }
+
+    fn insert(&mut self, call_id: String, capacity: usize) {
+        if !self.ids.insert(call_id.clone()) {
+            return;
+        }
+        self.order.push_back(call_id);
+        while self.ids.len() > capacity {
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("bounded call-id order follows the id set");
+            self.ids.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, call_id: &str) -> bool {
+        if !self.ids.remove(call_id) {
+            return false;
+        }
+        self.order.retain(|stored| stored != call_id);
+        true
+    }
 }
 
 /// Normalizes Codex collaboration events at the ACP boundary.
@@ -136,8 +175,9 @@ pub(super) struct NativeSubagentState {
     operations: HashMap<String, NativeSubagentOperation>,
     seen_activities: HashSet<String>,
     suppressed_v2_calls: HashMap<String, SuppressedV2Call>,
-    canonical_activity_calls: HashSet<String>,
-    emitted_v2_failures: HashSet<String>,
+    suppressed_v2_order: VecDeque<String>,
+    early_v2_activities: BoundedCallIds,
+    completed_v2_calls: BoundedCallIds,
 }
 
 impl NativeSubagentState {
@@ -352,30 +392,31 @@ impl NativeSubagentState {
             }
             ResponseItem::FunctionCall {
                 name,
-                namespace: None,
+                namespace,
                 arguments,
                 call_id,
                 ..
-            } if SuppressedV2Tool::from_name(name).is_some() => {
+            } if namespace.as_deref() == Some(MULTI_AGENT_V2_NAMESPACE)
+                && SuppressedV2Tool::from_name(name).is_some() =>
+            {
                 // Multi-agent v2 persists these raw calls as well as the
                 // canonical SubAgentActivity item. Defer to that item so the
                 // replay shape matches live delivery and does not double-log.
-                self.suppressed_v2_calls
-                    .entry(call_id.clone())
-                    .or_insert_with(|| SuppressedV2Call {
-                        tool: SuppressedV2Tool::from_name(name)
-                            .expect("guarded by SuppressedV2Tool::from_name"),
-                        raw_input: serde_json::from_str(arguments).ok(),
-                    });
+                self.remember_v2_call(
+                    call_id,
+                    SuppressedV2Tool::from_name(name)
+                        .expect("guarded by SuppressedV2Tool::from_name"),
+                    serde_json::from_str(arguments).ok(),
+                );
                 true
             }
             ResponseItem::FunctionCall {
                 name,
-                namespace: None,
+                namespace,
                 arguments,
                 call_id,
                 ..
-            } if name == "wait_agent" => {
+            } if namespace.as_deref() == Some(MULTI_AGENT_V2_NAMESPACE) && name == "wait_agent" => {
                 self.start_operation(
                     client,
                     call_id,
@@ -389,9 +430,12 @@ impl NativeSubagentState {
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
             } if self.suppressed_v2_calls.contains_key(call_id) => {
-                if !self.canonical_activity_calls.contains(call_id) {
-                    self.emit_v2_failure(client, call_id, output);
-                }
+                self.finish_v2_call(client, call_id, output);
+                true
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if self.completed_v2_calls.contains(call_id) =>
+            {
                 true
             }
             ResponseItem::FunctionCallOutput {
@@ -500,7 +544,12 @@ impl NativeSubagentState {
         // succeeds. Remember the call identity independently of item dedupe so
         // a later persisted FunctionCallOutput (including a post-hook failure)
         // cannot create a second transcript tool.
-        self.canonical_activity_calls.insert(event_id.to_string());
+        if let Some(call) = self.suppressed_v2_calls.get_mut(event_id) {
+            call.canonical_activity = true;
+        } else if !self.completed_v2_calls.contains(event_id) {
+            self.early_v2_activities
+                .insert(event_id.to_string(), MAX_EARLY_V2_ACTIVITIES);
+        }
 
         let event_key = format!("{event_id}:{thread_id}:{kind:?}");
         if !self.seen_activities.insert(event_key) {
@@ -567,18 +616,67 @@ impl NativeSubagentState {
         );
     }
 
-    fn emit_v2_failure(
+    fn remember_v2_call(
+        &mut self,
+        call_id: &str,
+        tool: SuppressedV2Tool,
+        raw_input: Option<Value>,
+    ) {
+        if self.completed_v2_calls.contains(call_id)
+            || self.suppressed_v2_calls.contains_key(call_id)
+        {
+            return;
+        }
+
+        while self.suppressed_v2_calls.len() >= MAX_PENDING_V2_CALLS {
+            let oldest = self
+                .suppressed_v2_order
+                .pop_front()
+                .expect("pending v2 order follows the pending map");
+            if self.suppressed_v2_calls.remove(&oldest).is_some() {
+                self.early_v2_activities.remove(&oldest);
+                self.completed_v2_calls
+                    .insert(oldest, MAX_COMPLETED_V2_CALLS);
+            }
+        }
+
+        let canonical_activity = self.early_v2_activities.remove(call_id);
+        self.suppressed_v2_calls.insert(
+            call_id.to_string(),
+            SuppressedV2Call {
+                tool,
+                raw_input,
+                canonical_activity,
+            },
+        );
+        self.suppressed_v2_order.push_back(call_id.to_string());
+    }
+
+    fn finish_v2_call(
         &mut self,
         client: &SessionClient,
         call_id: &str,
         output: &FunctionCallOutputPayload,
     ) {
-        if !self.emitted_v2_failures.insert(call_id.to_string()) {
-            return;
-        }
-        let Some(call) = self.suppressed_v2_calls.get(call_id).cloned() else {
+        let Some(call) = self.suppressed_v2_calls.remove(call_id) else {
             return;
         };
+        self.suppressed_v2_order.retain(|stored| stored != call_id);
+        self.early_v2_activities.remove(call_id);
+        if !call.canonical_activity {
+            self.emit_v2_failure(client, call_id, output, call);
+        }
+        self.completed_v2_calls
+            .insert(call_id.to_string(), MAX_COMPLETED_V2_CALLS);
+    }
+
+    fn emit_v2_failure(
+        &self,
+        client: &SessionClient,
+        call_id: &str,
+        output: &FunctionCallOutputPayload,
+        call: SuppressedV2Call,
+    ) {
         let parent = call
             .raw_input
             .as_ref()
