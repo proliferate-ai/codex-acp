@@ -748,6 +748,138 @@ fn native_v2_only_claims_the_configured_collaboration_namespace() {
 }
 
 #[test]
+fn native_v2_wait_live_and_replay_classify_plain_failures_and_structured_success() {
+    use codex_protocol::protocol::RawResponseItemEvent;
+
+    fn apply_raw(
+        state: &mut NativeSubagentState,
+        session: &SessionClient,
+        item: ResponseItem,
+        live: bool,
+    ) {
+        if live {
+            apply_event(
+                state,
+                session,
+                EventMsg::RawResponseItem(RawResponseItemEvent { item }),
+            );
+        } else {
+            apply_response(state, session, item);
+        }
+    }
+
+    fn fixture(live: bool) -> Vec<NativeNotice> {
+        let sender = fixed_thread_id(1);
+        let (client, session) = native_test_client();
+        let mut state = NativeSubagentState::default();
+
+        for (call_id, arguments, error) in [
+            (
+                "wait-invalid-timeout",
+                json!({"timeout_ms": 0}),
+                "timeout_ms must be at least 50",
+            ),
+            (
+                "wait-handler-failed",
+                json!({"targets": []}),
+                "failed to parse function arguments: unknown field `targets`, expected `timeout_ms`",
+            ),
+        ] {
+            apply_raw(
+                &mut state,
+                &session,
+                response_call(
+                    call_id,
+                    "wait_agent",
+                    Some(MULTI_AGENT_V2_NAMESPACE),
+                    arguments,
+                ),
+                live,
+            );
+            apply_raw(
+                &mut state,
+                &session,
+                response_text_output_with_success(call_id, error, live.then_some(false)),
+                live,
+            );
+        }
+
+        apply_raw(
+            &mut state,
+            &session,
+            response_call(
+                "wait-success",
+                "wait_agent",
+                Some(MULTI_AGENT_V2_NAMESPACE),
+                json!({"timeout_ms": 50}),
+            ),
+            live,
+        );
+        apply_event(
+            &mut state,
+            &session,
+            completed_collab_event(
+                "wait-success",
+                CollabAgentTool::Wait,
+                sender,
+                HashMap::new(),
+            ),
+        );
+        apply_raw(
+            &mut state,
+            &session,
+            response_text_output_with_success(
+                "wait-success",
+                r#"{"message":"Wait timed out.","timed_out":true}"#,
+                None,
+            ),
+            live,
+        );
+
+        native_notices(&client)
+    }
+
+    let live = fixture(true);
+    let replay = fixture(false);
+    assert_eq!(live, replay);
+    assert_eq!(
+        notice_shapes(&live),
+        [
+            "start:wait-invalid-timeout:InProgress:wait:-",
+            "update:wait-invalid-timeout:Failed:wait:-",
+            "start:wait-handler-failed:InProgress:wait:-",
+            "update:wait-handler-failed:Failed:wait:-",
+            "start:wait-success:InProgress:wait:-",
+            "update:wait-success:Completed:wait:-",
+        ]
+    );
+
+    let (v1_client, v1_session) = native_test_client();
+    let mut v1 = NativeSubagentState::default();
+    apply_response(
+        &mut v1,
+        &v1_session,
+        v1_call(
+            "wait-v1",
+            "wait_agent",
+            json!({"targets": [], "timeout_ms": 50}),
+        ),
+    );
+    apply_response(
+        &mut v1,
+        &v1_session,
+        response_text_output_with_success("wait-v1", r#"{"status":{},"timed_out":true}"#, None),
+    );
+    assert_eq!(
+        notice_shapes(&native_notices(&v1_client)),
+        [
+            "start:wait-v1:InProgress:wait:-",
+            "update:wait-v1:Completed:wait:-",
+        ]
+    );
+}
+
+#[test]
 fn native_v2_early_activity_marker_is_consumed_and_terminal_state_is_payload_free() {
     use codex_protocol::AgentPath;
 
@@ -841,7 +973,7 @@ fn native_v2_pending_orphans_and_id_only_tombstones_are_fifo_bounded() {
     assert!(state.completed_v2_calls.contains("orphan-1"));
 
     for index in 0..MAX_EARLY_V2_ACTIVITIES + 2 {
-        state
+        let _ = state
             .early_v2_activities
             .insert(format!("early-{index}"), MAX_EARLY_V2_ACTIVITIES);
     }
@@ -852,7 +984,7 @@ fn native_v2_pending_orphans_and_id_only_tombstones_are_fifo_bounded() {
     );
 
     for index in 0..MAX_COMPLETED_V2_CALLS + 2 {
-        state
+        let _ = state
             .completed_v2_calls
             .insert(format!("completed-{index}"), MAX_COMPLETED_V2_CALLS);
     }
@@ -864,6 +996,60 @@ fn native_v2_pending_orphans_and_id_only_tombstones_are_fifo_bounded() {
     assert!(!state.completed_v2_calls.contains("orphan-0"));
     assert!(!state.completed_v2_calls.contains("completed-0"));
     assert!(!state.completed_v2_calls.contains("completed-1"));
+}
+
+#[test]
+fn native_v2_evicted_early_activity_is_tombstoned_before_delayed_call_and_output() {
+    let child = fixed_thread_id(2);
+    let (client, session) = native_test_client();
+    let mut state = NativeSubagentState::default();
+
+    state.handle_activity(
+        &session,
+        "delayed-activity",
+        child,
+        "/root/reader",
+        SubAgentActivityKind::Started,
+        None,
+    );
+    for index in 1..=MAX_EARLY_V2_ACTIVITIES {
+        state.handle_activity(
+            &session,
+            &format!("later-activity-{index}"),
+            child,
+            "/root/reader",
+            SubAgentActivityKind::Interacted,
+            None,
+        );
+    }
+
+    assert!(!state.early_v2_activities.contains("delayed-activity"));
+    assert!(state.completed_v2_calls.contains("delayed-activity"));
+    let notice_count = native_notices(&client).len();
+
+    apply_response(
+        &mut state,
+        &session,
+        response_call(
+            "delayed-activity",
+            "spawn_agent",
+            Some(MULTI_AGENT_V2_NAMESPACE),
+            json!({
+                "message": "Inspect README.md",
+                "task_name": "reader",
+                "fork_turns": "none",
+            }),
+        ),
+    );
+    apply_response(
+        &mut state,
+        &session,
+        response_text_output_with_success("delayed-activity", "delayed failure output", None),
+    );
+
+    assert_eq!(native_notices(&client).len(), notice_count);
+    assert!(!state.suppressed_v2_calls.contains_key("delayed-activity"));
+    assert!(state.completed_v2_calls.contains("delayed-activity"));
 }
 
 #[test]

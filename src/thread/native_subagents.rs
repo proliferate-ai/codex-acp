@@ -79,6 +79,7 @@ struct NativeSubagentOperation {
     parent_tool_call_id: Option<String>,
     target_thread_ids: Vec<ThreadId>,
     emitted_status: Option<ToolCallStatus>,
+    v2_wait: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,17 +137,20 @@ impl BoundedCallIds {
         self.ids.contains(call_id)
     }
 
-    fn insert(&mut self, call_id: String, capacity: usize) {
+    fn insert(&mut self, call_id: String, capacity: usize) -> Option<String> {
         if !self.ids.insert(call_id.clone()) {
-            return;
+            return None;
         }
         self.order.push_back(call_id);
-        while self.ids.len() > capacity {
+        if self.ids.len() > capacity {
             let oldest = self
                 .order
                 .pop_front()
                 .expect("bounded call-id order follows the id set");
             self.ids.remove(&oldest);
+            Some(oldest)
+        } else {
+            None
         }
     }
 
@@ -417,14 +421,7 @@ impl NativeSubagentState {
                 call_id,
                 ..
             } if namespace.as_deref() == Some(MULTI_AGENT_V2_NAMESPACE) && name == "wait_agent" => {
-                self.start_operation(
-                    client,
-                    call_id,
-                    NativeSubagentTool::Wait,
-                    Vec::new(),
-                    None,
-                    serde_json::from_str(arguments).ok(),
-                );
+                self.start_v2_wait_operation(client, call_id, serde_json::from_str(arguments).ok());
                 true
             }
             ResponseItem::FunctionCallOutput {
@@ -547,8 +544,14 @@ impl NativeSubagentState {
         if let Some(call) = self.suppressed_v2_calls.get_mut(event_id) {
             call.canonical_activity = true;
         } else if !self.completed_v2_calls.contains(event_id) {
-            self.early_v2_activities
-                .insert(event_id.to_string(), MAX_EARLY_V2_ACTIVITIES);
+            if let Some(evicted) = self
+                .early_v2_activities
+                .insert(event_id.to_string(), MAX_EARLY_V2_ACTIVITIES)
+            {
+                let _ = self
+                    .completed_v2_calls
+                    .insert(evicted, MAX_COMPLETED_V2_CALLS);
+            }
         }
 
         let event_key = format!("{event_id}:{thread_id}:{kind:?}");
@@ -635,7 +638,8 @@ impl NativeSubagentState {
                 .expect("pending v2 order follows the pending map");
             if self.suppressed_v2_calls.remove(&oldest).is_some() {
                 self.early_v2_activities.remove(&oldest);
-                self.completed_v2_calls
+                let _ = self
+                    .completed_v2_calls
                     .insert(oldest, MAX_COMPLETED_V2_CALLS);
             }
         }
@@ -666,7 +670,8 @@ impl NativeSubagentState {
         if !call.canonical_activity {
             self.emit_v2_failure(client, call_id, output, call);
         }
-        self.completed_v2_calls
+        let _ = self
+            .completed_v2_calls
             .insert(call_id.to_string(), MAX_COMPLETED_V2_CALLS);
     }
 
@@ -738,7 +743,8 @@ impl NativeSubagentState {
             .to_text()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok());
         let raw_output = parsed.clone().or_else(|| serde_json::to_value(output).ok());
-        let failed = output.success == Some(false);
+        let failed = output.success == Some(false)
+            || (operation.v2_wait && !is_v2_wait_success(parsed.as_ref()));
 
         match operation.tool {
             NativeSubagentTool::Spawn => {
@@ -892,6 +898,25 @@ impl NativeSubagentState {
         self.start_operation(client, call_id, tool, targets, parent, raw_input);
     }
 
+    fn start_v2_wait_operation(
+        &mut self,
+        client: &SessionClient,
+        call_id: &str,
+        raw_input: Option<Value>,
+    ) {
+        self.start_operation(
+            client,
+            call_id,
+            NativeSubagentTool::Wait,
+            Vec::new(),
+            None,
+            raw_input,
+        );
+        if let Some(operation) = self.operations.get_mut(call_id) {
+            operation.v2_wait = true;
+        }
+    }
+
     fn start_operation(
         &mut self,
         client: &SessionClient,
@@ -942,6 +967,7 @@ impl NativeSubagentState {
                 parent_tool_call_id,
                 target_thread_ids,
                 emitted_status: None,
+                v2_wait: false,
             },
         );
     }
@@ -1153,6 +1179,14 @@ fn native_collab_tool_status(status: CollabAgentToolCallStatus) -> ToolCallStatu
 
 fn native_agent_title(nickname: Option<&str>, role: Option<&str>) -> String {
     nickname.or(role).unwrap_or("Subagent").to_string()
+}
+
+fn is_v2_wait_success(parsed: Option<&Value>) -> bool {
+    let Some(result) = parsed.and_then(Value::as_object) else {
+        return false;
+    };
+    result.get("message").and_then(Value::as_str).is_some()
+        && result.get("timed_out").and_then(Value::as_bool).is_some()
 }
 
 fn native_targets_from_input(tool: NativeSubagentTool, input: &Value) -> Vec<ThreadId> {
