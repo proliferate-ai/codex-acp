@@ -548,15 +548,15 @@ impl NativeSubagentState {
         // cannot create a second transcript tool.
         if let Some(call) = self.suppressed_v2_calls.get_mut(event_id) {
             call.canonical_activity = true;
-        } else if !self.completed_v2_calls.contains(event_id) {
-            if let Some(evicted) = self
+        } else if !self.completed_v2_calls.contains(event_id)
+            && let Some(evicted) = self
                 .early_v2_activities
                 .insert(event_id.to_string(), MAX_EARLY_V2_ACTIVITIES)
-            {
-                let _ = self
-                    .completed_v2_calls
-                    .insert(evicted, MAX_COMPLETED_V2_CALLS);
-            }
+        {
+            drop(
+                self.completed_v2_calls
+                    .insert(evicted, MAX_COMPLETED_V2_CALLS),
+            );
         }
 
         let event_key = format!("{event_id}:{thread_id}:{kind:?}");
@@ -643,9 +643,10 @@ impl NativeSubagentState {
                 .expect("pending v2 order follows the pending map");
             if self.suppressed_v2_calls.remove(&oldest).is_some() {
                 self.early_v2_activities.remove(&oldest);
-                let _ = self
-                    .completed_v2_calls
-                    .insert(oldest, MAX_COMPLETED_V2_CALLS);
+                drop(
+                    self.completed_v2_calls
+                        .insert(oldest, MAX_COMPLETED_V2_CALLS),
+                );
             }
         }
 
@@ -675,9 +676,10 @@ impl NativeSubagentState {
         if !call.canonical_activity {
             self.emit_v2_failure(client, call_id, output, call);
         }
-        let _ = self
-            .completed_v2_calls
-            .insert(call_id.to_string(), MAX_COMPLETED_V2_CALLS);
+        drop(
+            self.completed_v2_calls
+                .insert(call_id.to_string(), MAX_COMPLETED_V2_CALLS),
+        );
     }
 
     fn emit_v2_failure(

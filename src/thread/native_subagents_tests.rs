@@ -1007,9 +1007,11 @@ fn native_v2_pending_orphans_and_id_only_tombstones_are_fifo_bounded() {
     assert!(state.completed_v2_calls.contains("orphan-1"));
 
     for index in 0..MAX_EARLY_V2_ACTIVITIES + 2 {
-        let _ = state
-            .early_v2_activities
-            .insert(format!("early-{index}"), MAX_EARLY_V2_ACTIVITIES);
+        drop(
+            state
+                .early_v2_activities
+                .insert(format!("early-{index}"), MAX_EARLY_V2_ACTIVITIES),
+        );
     }
     assert_eq!(state.early_v2_activities.ids.len(), MAX_EARLY_V2_ACTIVITIES);
     assert_eq!(
@@ -1018,9 +1020,11 @@ fn native_v2_pending_orphans_and_id_only_tombstones_are_fifo_bounded() {
     );
 
     for index in 0..MAX_COMPLETED_V2_CALLS + 2 {
-        let _ = state
-            .completed_v2_calls
-            .insert(format!("completed-{index}"), MAX_COMPLETED_V2_CALLS);
+        drop(
+            state
+                .completed_v2_calls
+                .insert(format!("completed-{index}"), MAX_COMPLETED_V2_CALLS),
+        );
     }
     assert_eq!(state.completed_v2_calls.ids.len(), MAX_COMPLETED_V2_CALLS);
     assert_eq!(
