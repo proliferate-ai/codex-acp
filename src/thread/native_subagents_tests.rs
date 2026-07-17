@@ -825,6 +825,13 @@ fn native_v2_wait_live_and_replay_classify_plain_failures_and_structured_success
                 HashMap::new(),
             ),
         );
+        assert!(
+            state
+                .operations
+                .get("wait-success")
+                .is_some_and(|operation| operation.target_thread_ids.is_empty()),
+            "v2 wait success must remain safe when no target threads are reported",
+        );
         apply_raw(
             &mut state,
             &session,

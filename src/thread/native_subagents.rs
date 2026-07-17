@@ -803,9 +803,10 @@ impl NativeSubagentState {
                     .as_ref()
                     .and_then(|value| value.get("status"))
                     .and_then(Value::as_object);
-                let sole_target = (status_values.is_some_and(|values| values.len() == 1)
-                    && operation.target_thread_ids.len() == 1)
-                    .then_some(operation.target_thread_ids[0]);
+                let sole_target = match (status_values, operation.target_thread_ids.as_slice()) {
+                    (Some(values), [target]) if values.len() == 1 => Some(*target),
+                    _ => None,
+                };
                 let statuses = status_values
                     .into_iter()
                     .flatten()
