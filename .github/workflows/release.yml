@@ -494,6 +494,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.get-version.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
           name: Release ${{ needs.get-version.outputs.version }}
           draft: false
           prerelease: false
