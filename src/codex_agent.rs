@@ -13,8 +13,8 @@ use acp::schema::{
 };
 use acp::{Agent, Client, ConnectTo, ConnectionTo, Error, Responder};
 use agent_client_protocol as acp;
-use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_analytics::AnalyticsEventsClient;
+use codex_config::{DEFAULT_MCP_SERVER_ENVIRONMENT_ID, McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, StateDbHandle, ThreadManager, config::Config,
     find_thread_path_by_id_str, init_state_db, resolve_installation_id, thread_store_from_config,
@@ -38,11 +38,11 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
-use serde_json::json;
 use codex_thread_store::{
     ListThreadsParams, SortDirection as StoreSortDirection, ThreadSortKey as StoreThreadSortKey,
     ThreadStore,
 };
+use serde_json::json;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -361,7 +361,9 @@ impl CodexAgent {
                         let agent = agent.clone();
                         let session_cx = cx.clone();
                         cx.spawn(async move {
-                            agent.handle_goal_request(request, responder, session_cx).await;
+                            agent
+                                .handle_goal_request(request, responder, session_cx)
+                                .await;
                             Ok(())
                         })?;
                         Ok(())
@@ -1005,10 +1007,7 @@ impl CodexAgent {
         }
     }
 
-    async fn goal_set(
-        &self,
-        params: GoalSetParams,
-    ) -> Result<(GoalWire, GoalSetOutcome), Error> {
+    async fn goal_set(&self, params: GoalSetParams) -> Result<(GoalWire, GoalSetOutcome), Error> {
         self.ensure_goals_enabled()?;
         let ctx = self.goal_thread_context(&params.session_id).await?;
         self.reconcile_goal_rollout(&ctx).await;
@@ -1046,16 +1045,15 @@ impl CodexAgent {
         // written; persist the goal update through the live thread so its
         // JSONL rollout and SQLite preview metadata stay in sync (mirrors the
         // app-server backend).
-        if let Ok(thread) = self.thread_manager.get_thread(ctx.thread_id).await {
-            if let Err(err) = thread
+        if let Ok(thread) = self.thread_manager.get_thread(ctx.thread_id).await
+            && let Err(err) = thread
                 .append_rollout_items(&[outcome.thread_goal_updated_item()])
                 .await
-            {
-                tracing::warn!(
-                    "failed to persist goal update for live thread {}: {err}",
-                    ctx.thread_id
-                );
-            }
+        {
+            tracing::warn!(
+                "failed to persist goal update for live thread {}: {err}",
+                ctx.thread_id
+            );
         }
 
         let goal_wire = GoalWire::from_protocol(&outcome.goal);
@@ -1100,10 +1098,14 @@ impl CodexAgent {
         let (rollout_path, state_db) = match running_thread.as_ref() {
             Some(thread) => {
                 let rollout_path = thread.rollout_path().ok_or_else(|| {
-                    Error::invalid_params()
-                        .data(format!("ephemeral thread does not support goals: {thread_id}"))
+                    Error::invalid_params().data(format!(
+                        "ephemeral thread does not support goals: {thread_id}"
+                    ))
                 })?;
-                (rollout_path, thread.state_db().or_else(|| self.state_db.clone()))
+                (
+                    rollout_path,
+                    thread.state_db().or_else(|| self.state_db.clone()),
+                )
             }
             None => {
                 let rollout_path = find_thread_path_by_id_str(
