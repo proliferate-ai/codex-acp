@@ -836,6 +836,38 @@ fn native_v2_wait_live_and_replay_classify_plain_failures_and_structured_success
             live,
         );
 
+        apply_raw(
+            &mut state,
+            &session,
+            response_call(
+                "wait-post-hook-failed",
+                "wait_agent",
+                Some(MULTI_AGENT_V2_NAMESPACE),
+                json!({"timeout_ms": 50}),
+            ),
+            live,
+        );
+        apply_event(
+            &mut state,
+            &session,
+            completed_collab_event(
+                "wait-post-hook-failed",
+                CollabAgentTool::Wait,
+                sender,
+                HashMap::new(),
+            ),
+        );
+        apply_raw(
+            &mut state,
+            &session,
+            response_text_output_with_success(
+                "wait-post-hook-failed",
+                "PostToolUse hook blocked the completed result",
+                live.then_some(false),
+            ),
+            live,
+        );
+
         native_notices(&client)
     }
 
@@ -851,6 +883,8 @@ fn native_v2_wait_live_and_replay_classify_plain_failures_and_structured_success
             "update:wait-handler-failed:Failed:wait:-",
             "start:wait-success:InProgress:wait:-",
             "update:wait-success:Completed:wait:-",
+            "start:wait-post-hook-failed:InProgress:wait:-",
+            "update:wait-post-hook-failed:Completed:wait:-",
         ]
     );
 

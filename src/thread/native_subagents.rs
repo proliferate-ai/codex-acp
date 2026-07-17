@@ -80,6 +80,7 @@ struct NativeSubagentOperation {
     target_thread_ids: Vec<ThreadId>,
     emitted_status: Option<ToolCallStatus>,
     v2_wait: bool,
+    canonical_terminal: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -473,6 +474,10 @@ impl NativeSubagentState {
             return;
         }
 
+        if let Some(operation) = self.operations.get_mut(&item.id) {
+            operation.canonical_terminal = true;
+        }
+
         if tool == NativeSubagentTool::Spawn {
             for thread_id in &targets {
                 self.parents_by_thread.insert(*thread_id, item.id.clone());
@@ -743,8 +748,9 @@ impl NativeSubagentState {
             .to_text()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok());
         let raw_output = parsed.clone().or_else(|| serde_json::to_value(output).ok());
-        let failed = output.success == Some(false)
-            || (operation.v2_wait && !is_v2_wait_success(parsed.as_ref()));
+        let failed = (output.success == Some(false)
+            || (operation.v2_wait && !is_v2_wait_success(parsed.as_ref())))
+            && !(operation.v2_wait && operation.canonical_terminal);
 
         match operation.tool {
             NativeSubagentTool::Spawn => {
@@ -968,6 +974,7 @@ impl NativeSubagentState {
                 target_thread_ids,
                 emitted_status: None,
                 v2_wait: false,
+                canonical_terminal: false,
             },
         );
     }
