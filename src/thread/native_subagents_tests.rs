@@ -150,9 +150,16 @@ fn response_output(call_id: &str, output: Value) -> ResponseItem {
 }
 
 fn response_output_with_success(call_id: &str, output: Value, success: bool) -> ResponseItem {
-    let mut payload =
-        codex_protocol::models::FunctionCallOutputPayload::from_text(output.to_string());
-    payload.success = Some(success);
+    response_text_output_with_success(call_id, output.to_string(), Some(success))
+}
+
+fn response_text_output_with_success(
+    call_id: &str,
+    output: impl Into<String>,
+    success: Option<bool>,
+) -> ResponseItem {
+    let mut payload = codex_protocol::models::FunctionCallOutputPayload::from_text(output.into());
+    payload.success = success;
     ResponseItem::FunctionCallOutput {
         id: None,
         call_id: call_id.to_string(),
@@ -417,7 +424,14 @@ fn native_v2_activity_live_and_paginated_replay_match_without_raw_call_duplicate
             "send_message",
             SubAgentActivityKind::Interacted,
             json!({"target": "/root/reader", "message": "Continue"}),
-            response_output("message-v2", json!({})),
+            // A post-tool hook can fail after the collaboration handler has
+            // already emitted its canonical activity. The later failed output
+            // must not create a duplicate failure tool.
+            response_output_with_success(
+                "message-v2",
+                json!({"error": "post-tool hook rejected the result"}),
+                false,
+            ),
         ),
     ];
 
@@ -502,6 +516,157 @@ fn native_v2_activity_live_and_paginated_replay_match_without_raw_call_duplicate
     assert_eq!(notices[0].native_tool_name, "Agent");
     assert_eq!(notices[1].parent_tool_call_id.as_deref(), Some("spawn-v2"),);
     assert_eq!(notices[2].parent_tool_call_id.as_deref(), Some("spawn-v2"),);
+}
+
+#[test]
+fn native_v2_failed_calls_survive_live_and_paginated_replay_without_success_flag() {
+    use codex_protocol::{
+        AgentPath,
+        protocol::{RawResponseItemEvent, SubAgentActivityEvent},
+    };
+
+    fn apply_raw(
+        state: &mut NativeSubagentState,
+        session: &SessionClient,
+        item: ResponseItem,
+        live: bool,
+    ) {
+        if live {
+            apply_event(
+                state,
+                session,
+                EventMsg::RawResponseItem(RawResponseItemEvent { item }),
+            );
+        } else {
+            apply_response(state, session, item);
+        }
+    }
+
+    fn fixture(live: bool) -> Vec<NativeNotice> {
+        let sender = fixed_thread_id(1);
+        let child = fixed_thread_id(2);
+        let path = AgentPath::try_from("/root/reader").expect("fixed agent path");
+        let (client, session) = native_test_client();
+        let mut state = NativeSubagentState::default();
+
+        apply_raw(
+            &mut state,
+            &session,
+            response_call(
+                "spawn-seed",
+                "spawn_agent",
+                None,
+                json!({
+                    "message": "Inspect README.md",
+                    "task_name": "reader",
+                    "fork_turns": "none",
+                }),
+            ),
+            live,
+        );
+        apply_event(
+            &mut state,
+            &session,
+            completed_native_item(
+                sender,
+                TurnItem::SubAgentActivity(SubAgentActivityItem {
+                    id: "spawn-seed".to_string(),
+                    kind: SubAgentActivityKind::Started,
+                    agent_thread_id: child,
+                    agent_path: path.clone(),
+                }),
+            ),
+        );
+        if live {
+            let notice_count = native_notices(&client).len();
+            apply_event(
+                &mut state,
+                &session,
+                EventMsg::SubAgentActivity(SubAgentActivityEvent {
+                    event_id: "spawn-seed".to_string(),
+                    occurred_at_ms: 1,
+                    agent_thread_id: child,
+                    agent_path: path,
+                    kind: SubAgentActivityKind::Started,
+                }),
+            );
+            assert_eq!(native_notices(&client).len(), notice_count);
+        }
+        apply_raw(
+            &mut state,
+            &session,
+            response_text_output_with_success(
+                "spawn-seed",
+                r#"{"task_name":"/root/reader","nickname":"reader"}"#,
+                live.then_some(true),
+            ),
+            live,
+        );
+
+        let failures = [
+            (
+                "spawn-invalid",
+                "spawn_agent",
+                json!({
+                    "message": "Inspect README.md",
+                    "task_name": "invalid",
+                    "fork_turns": "0",
+                }),
+                "fork_turns must be `none`, `all`, or a positive integer string",
+            ),
+            (
+                "message-failed",
+                "send_message",
+                json!({"target": "/root/reader", "message": ""}),
+                "Empty message can't be sent to an agent",
+            ),
+            (
+                "followup-failed",
+                "followup_task",
+                json!({"target": "reader", "message": ""}),
+                "Empty message can't be sent to an agent",
+            ),
+            (
+                "interrupt-failed",
+                "interrupt_agent",
+                json!({"target": child}),
+                "failed to interrupt agent",
+            ),
+        ];
+        for (call_id, name, arguments, error) in failures {
+            apply_raw(
+                &mut state,
+                &session,
+                response_call(call_id, name, None, arguments),
+                live,
+            );
+            let output = response_text_output_with_success(call_id, error, live.then_some(false));
+            apply_raw(&mut state, &session, output.clone(), live);
+            // Duplicate delivery must not create a second logical item/output.
+            apply_raw(&mut state, &session, output, live);
+        }
+
+        native_notices(&client)
+    }
+
+    let live = fixture(true);
+    let replay = fixture(false);
+    assert_eq!(live, replay);
+    assert_eq!(
+        notice_shapes(&live),
+        [
+            "start:spawn-seed:InProgress:Agent:-",
+            "start:spawn-seed:subagent_activity:Completed:subagent_activity:spawn-seed",
+            "start:spawn-invalid:InProgress:Agent:-",
+            "update:spawn-invalid:Failed:Agent:-",
+            "start:message-failed:InProgress:send_input:spawn-seed",
+            "update:message-failed:Failed:send_input:spawn-seed",
+            "start:followup-failed:InProgress:send_input:spawn-seed",
+            "update:followup-failed:Failed:send_input:spawn-seed",
+            "start:interrupt-failed:InProgress:close_agent:spawn-seed",
+            "update:interrupt-failed:Failed:close_agent:spawn-seed",
+        ]
+    );
 }
 
 #[test]

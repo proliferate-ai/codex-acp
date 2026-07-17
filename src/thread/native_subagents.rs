@@ -77,6 +77,49 @@ struct NativeSubagentOperation {
     emitted_status: Option<ToolCallStatus>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SuppressedV2Tool {
+    Spawn,
+    Message,
+    Followup,
+    Interrupt,
+}
+
+impl SuppressedV2Tool {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "spawn_agent" => Some(Self::Spawn),
+            "send_message" => Some(Self::Message),
+            "followup_task" => Some(Self::Followup),
+            "interrupt_agent" => Some(Self::Interrupt),
+            _ => None,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Spawn => "Spawn subagent",
+            Self::Message => "Message subagent",
+            Self::Followup => "Follow up with subagent",
+            Self::Interrupt => "Interrupt subagent",
+        }
+    }
+
+    fn native_name(self) -> &'static str {
+        match self {
+            Self::Spawn => "Agent",
+            Self::Message | Self::Followup => "send_input",
+            Self::Interrupt => "close_agent",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SuppressedV2Call {
+    tool: SuppressedV2Tool,
+    raw_input: Option<Value>,
+}
+
 /// Normalizes Codex collaboration events at the ACP boundary.
 ///
 /// Codex persists two rollout generations: legacy function call/output pairs
@@ -92,7 +135,9 @@ pub(super) struct NativeSubagentState {
     parent_statuses: HashMap<String, ToolCallStatus>,
     operations: HashMap<String, NativeSubagentOperation>,
     seen_activities: HashSet<String>,
-    suppressed_response_calls: HashSet<String>,
+    suppressed_v2_calls: HashMap<String, SuppressedV2Call>,
+    canonical_activity_calls: HashSet<String>,
+    emitted_v2_failures: HashSet<String>,
 }
 
 impl NativeSubagentState {
@@ -308,17 +353,20 @@ impl NativeSubagentState {
             ResponseItem::FunctionCall {
                 name,
                 namespace: None,
+                arguments,
                 call_id,
                 ..
-            } if matches!(
-                name.as_str(),
-                "spawn_agent" | "send_message" | "followup_task" | "interrupt_agent"
-            ) =>
-            {
+            } if SuppressedV2Tool::from_name(name).is_some() => {
                 // Multi-agent v2 persists these raw calls as well as the
                 // canonical SubAgentActivity item. Defer to that item so the
                 // replay shape matches live delivery and does not double-log.
-                self.suppressed_response_calls.insert(call_id.clone());
+                self.suppressed_v2_calls
+                    .entry(call_id.clone())
+                    .or_insert_with(|| SuppressedV2Call {
+                        tool: SuppressedV2Tool::from_name(name)
+                            .expect("guarded by SuppressedV2Tool::from_name"),
+                        raw_input: serde_json::from_str(arguments).ok(),
+                    });
                 true
             }
             ResponseItem::FunctionCall {
@@ -338,9 +386,12 @@ impl NativeSubagentState {
                 );
                 true
             }
-            ResponseItem::FunctionCallOutput { call_id, .. }
-                if self.suppressed_response_calls.contains(call_id) =>
-            {
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } if self.suppressed_v2_calls.contains_key(call_id) => {
+                if !self.canonical_activity_calls.contains(call_id) {
+                    self.emit_v2_failure(client, call_id, output);
+                }
                 true
             }
             ResponseItem::FunctionCallOutput {
@@ -445,6 +496,12 @@ impl NativeSubagentState {
         kind: SubAgentActivityKind,
         raw_output: Option<Value>,
     ) {
+        // V2 collaboration handlers emit this item only after their operation
+        // succeeds. Remember the call identity independently of item dedupe so
+        // a later persisted FunctionCallOutput (including a post-hook failure)
+        // cannot create a second transcript tool.
+        self.canonical_activity_calls.insert(event_id.to_string());
+
         let event_key = format!("{event_id}:{thread_id}:{kind:?}");
         if !self.seen_activities.insert(event_key) {
             return;
@@ -508,6 +565,65 @@ impl NativeSubagentState {
                 "activity": kind,
             }),
         );
+    }
+
+    fn emit_v2_failure(
+        &mut self,
+        client: &SessionClient,
+        call_id: &str,
+        output: &FunctionCallOutputPayload,
+    ) {
+        if !self.emitted_v2_failures.insert(call_id.to_string()) {
+            return;
+        }
+        let Some(call) = self.suppressed_v2_calls.get(call_id).cloned() else {
+            return;
+        };
+        let parent = call
+            .raw_input
+            .as_ref()
+            .and_then(|input| input.get("target"))
+            .and_then(Value::as_str)
+            .and_then(|target| self.parent_for_v2_target(target));
+        let meta = native_subagent_meta(call.tool.native_name(), parent.as_deref());
+        let mut tool_call = ToolCall::new(call_id.to_string(), call.tool.title())
+            .kind(ToolKind::Think)
+            .status(ToolCallStatus::InProgress)
+            .meta(meta.clone());
+        if let Some(raw_input) = call.raw_input {
+            tool_call = tool_call.raw_input(raw_input);
+        }
+        client.send_tool_call(tool_call);
+
+        let raw_output = output
+            .body
+            .to_text()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .or_else(|| serde_json::to_value(output).ok());
+        let mut fields = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
+        if let Some(raw_output) = raw_output {
+            fields = fields.raw_output(raw_output);
+        }
+        client.send_tool_call_update(ToolCallUpdate::new(call_id.to_string(), fields).meta(meta));
+    }
+
+    fn parent_for_v2_target(&self, target: &str) -> Option<String> {
+        if let Ok(thread_id) = ThreadId::from_string(target)
+            && let Some(parent) = self.parents_by_thread.get(&thread_id)
+        {
+            return Some(parent.clone());
+        }
+        if let Some((_, parent)) = self.agents_by_path.get(target) {
+            return Some(parent.clone());
+        }
+
+        let mut parents = self
+            .agents_by_path
+            .iter()
+            .filter(|(path, _)| path.rsplit('/').next() == Some(target))
+            .map(|(_, (_, parent))| parent);
+        let parent = parents.next()?.clone();
+        parents.next().is_none().then_some(parent)
     }
 
     fn handle_response_output(
