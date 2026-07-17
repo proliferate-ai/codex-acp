@@ -32,6 +32,7 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_prompts::user_facing_hint,
 };
+use codex_extension_api::ExtensionEventSink;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -71,10 +72,9 @@ use codex_protocol::{
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadSettingsOverrides, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -151,7 +151,7 @@ const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
 
 // Anyharness meta keys and event names
-const ANYHARNESS_META_KEY: &str = "anyharness";
+use crate::goals::{ANYHARNESS_META_KEY, GoalWire, goal_notification_update};
 const ANYHARNESS_ASSISTANT_MESSAGE_COMPLETED_EVENT: &str = "assistant_message_completed";
 // TODO: re-wire transient status events (0.16 port gap — the 0.11 lineage
 // emitted these and the anyharness sink still consumes them).
@@ -505,6 +505,85 @@ enum ThreadMessage {
     },
 }
 
+/// Process-wide map from a session id to the live ACP client for that session.
+///
+/// At codex core rust-v0.144.1 goals became an installed extension whose
+/// `ThreadGoalUpdated` events are delivered through the host
+/// [`ExtensionEventSink`] instead of the thread's own event stream. codex-acp
+/// registers every session's [`SessionClient`] here so the goal event sink can
+/// route those updates back to the owning session's connection.
+#[derive(Clone, Default)]
+pub struct GoalNotificationRegistry {
+    clients: Arc<Mutex<HashMap<SessionId, (u64, SessionClient)>>>,
+    next_token: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl GoalNotificationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers (or replaces) the session's client and returns a token that
+    /// identifies THIS registration. `unregister` requires the token so a
+    /// superseded thread's Drop cannot remove its replacement: re-loading an
+    /// already-open session registers the new client first, then the map
+    /// insert drops the evicted thread — an unconditional remove there would
+    /// silently unroute all subsequent goal events for the session.
+    fn register(&self, session_id: SessionId, client: SessionClient) -> u64 {
+        let token = self
+            .next_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(session_id, (token, client));
+        token
+    }
+
+    fn unregister(&self, session_id: &SessionId, token: u64) {
+        let mut clients = self.clients.lock().unwrap();
+        if clients
+            .get(session_id)
+            .is_some_and(|(current, _)| *current == token)
+        {
+            clients.remove(session_id);
+        }
+    }
+
+    fn client_for(&self, session_id: &SessionId) -> Option<SessionClient> {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|(_, client)| client.clone())
+    }
+}
+
+/// [`ExtensionEventSink`] that forwards goal-engine `ThreadGoalUpdated` events
+/// to the owning session's ACP client as tagged goal chunks, matching the
+/// shape the anyharness runtime consumes. Non-goal extension events are
+/// dropped (codex-acp does not surface other extension-emitted events).
+pub struct GoalExtensionEventSink {
+    registry: GoalNotificationRegistry,
+}
+
+impl GoalExtensionEventSink {
+    pub fn new(registry: GoalNotificationRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+impl ExtensionEventSink for GoalExtensionEventSink {
+    fn emit(&self, event: Event) {
+        if let EventMsg::ThreadGoalUpdated(goal_event) = event.msg {
+            let session_id = SessionId::new(goal_event.goal.thread_id.to_string());
+            if let Some(client) = self.registry.client_for(&session_id) {
+                client.send_goal_transcript_event(&goal_event.goal);
+            }
+        }
+    }
+}
+
 pub struct Thread {
     /// Direct handle to the underlying Codex thread for out-of-band shutdown.
     thread: Arc<dyn CodexThreadImpl>,
@@ -512,9 +591,26 @@ pub struct Thread {
     message_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// Keep the actor task alive for the lifetime of the thread wrapper.
     _handle: tokio::task::JoinHandle<()>,
+    /// Registry to deregister this session's goal-notification client on drop.
+    goal_registry: GoalNotificationRegistry,
+    /// Session id used to deregister from `goal_registry` on drop.
+    session_id: SessionId,
+    /// Identifies this thread's registration in `goal_registry`; Drop only
+    /// removes the entry when it still owns it (see `register`).
+    goal_registry_token: u64,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        self.goal_registry
+            .unregister(&self.session_id, self.goal_registry_token);
+    }
 }
 
 impl Thread {
+    // This constructor assembles the actor's runtime dependencies explicitly;
+    // grouping them would only move the same coupling into an opaque bag.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -523,13 +619,20 @@ impl Thread {
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
         cx: ConnectionTo<Client>,
+        goal_registry: GoalNotificationRegistry,
     ) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = mpsc::unbounded_channel();
 
+        let session_client = SessionClient::new(session_id.clone(), cx, client_capabilities);
+        // Register the client so the goal extension's event sink can deliver
+        // `ThreadGoalUpdated` notifications to this session.
+        let goal_registry_token =
+            goal_registry.register(session_id.clone(), session_client.clone());
+
         let actor = ThreadActor::new(
             auth,
-            SessionClient::new(session_id, cx, client_capabilities),
+            session_client,
             thread.clone(),
             models_manager,
             config,
@@ -543,6 +646,9 @@ impl Thread {
             thread,
             message_tx,
             _handle: handle,
+            goal_registry,
+            session_id,
+            goal_registry_token,
         }
     }
 
@@ -1060,24 +1166,6 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
         _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
-    }
-}
-
-fn format_thread_goal_update(event: &ThreadGoalUpdatedEvent) -> String {
-    let status = match event.goal.status {
-        ThreadGoalStatus::Active => "active",
-        ThreadGoalStatus::Paused => "paused",
-        ThreadGoalStatus::BudgetLimited => "budget limited",
-        ThreadGoalStatus::Blocked => "blocked",
-        ThreadGoalStatus::UsageLimited => "usage limited",
-        ThreadGoalStatus::Complete => "complete",
-    };
-
-    let objective = event.goal.objective.trim();
-    if objective.contains('\n') {
-        format!("Goal updated ({status}):\n{objective}")
-    } else {
-        format!("Goal updated ({status}): {objective}")
     }
 }
 
@@ -1602,7 +1690,7 @@ impl PromptState {
             }
             EventMsg::ThreadGoalUpdated(event) => {
                 info!("Thread goal updated: {:?}", event.goal.objective);
-                client.send_agent_text(format_thread_goal_update(&event));
+                client.send_goal_transcript_event(&event.goal);
             }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
@@ -3377,6 +3465,17 @@ impl SessionClient {
         ));
     }
 
+    /// Emit the anyharness-tagged, zero-length `AgentMessageChunk` for a
+    /// native goal update (`goal_updated`, or `goal_met` when the goal
+    /// reached its terminal complete state).
+    fn send_goal_transcript_event(&self, goal: &codex_protocol::protocol::ThreadGoal) {
+        let wire = GoalWire::from_protocol(goal);
+        self.send_notification(goal_notification_update(
+            wire.transcript_event(),
+            Some(&wire),
+        ));
+    }
+
     // TODO: re-wire transient status events (0.16 port gap).
     #[allow(dead_code)]
     fn send_transient_status(&self, text: impl Into<String>, message_id: impl Into<String>) {
@@ -4319,14 +4418,13 @@ impl<A: Auth> ThreadActor<A> {
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
                 self.client.send_agent_thought(text.clone());
             }
-            EventMsg::ThreadGoalUpdated(event) => {
-                self.client
-                    .send_agent_text(format_thread_goal_update(event));
-            }
             // Skip other event types during replay - they either:
             // - Are transient (deltas, turn lifecycle)
             // - Don't have direct ACP equivalents
             // - Are handled via ResponseItem instead
+            // ThreadGoalUpdated is also skipped: replayed history is not a
+            // native transition — attach-time goal state comes from the
+            // reconcile pull (`goal/get`), never from replay.
             _ => {}
         }
     }
@@ -4649,9 +4747,48 @@ impl<A: Auth> ThreadActor<A> {
 
         if let Some(submission) = self.submissions.get_mut(&id) {
             submission.handle_event(&self.client, msg).await;
-        } else {
-            warn!("Received event for unknown submission ID: {id} {msg:?}");
+            return;
         }
+
+        // Goal-engine continuation turns run without an ACP `session/prompt`
+        // submission: codex-core starts them internally with a fresh sub_id
+        // that never went through `handle_prompt`, so their first event
+        // arrives for an id we've never seen. Lazily register a synthetic
+        // submission the moment that happens so the turn's transcript
+        // content, tool calls, and approval requests flow through the same
+        // per-turn state machine (and permission-response routing) as a
+        // normal turn, instead of being silently dropped.
+        info!(
+            "Registering synthetic submission for engine-initiated turn without an ACP submission: {id}"
+        );
+        let client = self.client.clone();
+        let submission = self.register_engine_initiated_submission(id);
+        submission.handle_event(&client, msg).await;
+    }
+
+    /// Creates and registers a `SubmissionState` for an engine-initiated turn
+    /// (e.g. a goal continuation turn) that has no corresponding ACP
+    /// `session/prompt` call. There is no RPC response to eventually resolve,
+    /// so we drain the paired oneshot receiver in the background purely to
+    /// keep `PromptState::is_active` true while the turn is in flight; it
+    /// naturally goes inactive (and gets reaped by the litter collector in
+    /// `spawn`) once the turn completes and `response_tx` is consumed like
+    /// any other turn.
+    fn register_engine_initiated_submission(
+        &mut self,
+        submission_id: String,
+    ) -> &mut SubmissionState {
+        let (response_tx, response_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            drop(response_rx.await);
+        });
+        let state = SubmissionState::Prompt(PromptState::new(
+            submission_id.clone(),
+            self.thread.clone(),
+            self.resolution_tx.clone(),
+            response_tx,
+        ));
+        self.submissions.entry(submission_id).or_insert(state)
     }
 }
 
@@ -5077,7 +5214,10 @@ mod tests {
         test_support::{all_model_presets, builtin_collaboration_mode_presets},
     };
     use codex_protocol::config_types::ModeKind;
-    use codex_protocol::{ThreadId, protocol::ThreadGoal};
+    use codex_protocol::{
+        ThreadId,
+        protocol::{ThreadGoal, ThreadGoalStatus, ThreadGoalUpdatedEvent},
+    };
     use tokio::sync::{Mutex, Notify, mpsc::UnboundedSender};
 
     use super::*;
@@ -5124,15 +5264,196 @@ mod tests {
         drop(message_tx);
 
         let notifications = client.notifications.lock().unwrap();
-        assert!(notifications.iter().any(|notification| {
-            matches!(
-                &notification.update,
+        let goal_meta = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
                 SessionUpdate::AgentMessageChunk(ContentChunk {
                     content: ContentBlock::Text(TextContent { text, .. }),
+                    meta: Some(meta),
                     ..
-                }) if text == "Goal updated (active): Ship the goal update"
-            )
-        }));
+                }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).cloned(),
+                _ => None,
+            })
+            .expect("expected an anyharness-tagged goal notification chunk");
+
+        assert_eq!(goal_meta["schemaVersion"], 1);
+        assert_eq!(goal_meta["transcriptEvent"], "goal_updated");
+        assert_eq!(goal_meta["goal"]["objective"], "Ship the goal update");
+        assert_eq!(goal_meta["goal"]["status"], "active");
+        assert_eq!(goal_meta["goal"]["nativeStatus"], "active");
+        assert_eq!(goal_meta["goal"]["tokenBudget"], 100);
+        assert_eq!(goal_meta["goal"]["tokensUsed"], 10);
+        assert_eq!(goal_meta["goal"]["timeUsedSeconds"], 2);
+        assert_eq!(goal_meta["goal"]["native"], true);
+        assert_eq!(goal_meta["goal"]["updatedAtMs"], 2000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_thread_goal_updated_without_submission_is_forwarded() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+
+        let thread_id = ThreadId::default();
+        conversation.op_tx.send(Event {
+            id: "goal-engine-turn".to_string(),
+            msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+                thread_id,
+                turn_id: Some("goal-engine-turn".to_string()),
+                goal: ThreadGoal {
+                    thread_id,
+                    objective: "Ship the goal update".to_string(),
+                    status: ThreadGoalStatus::Complete,
+                    token_budget: Some(100),
+                    tokens_used: 90,
+                    time_used_seconds: 12,
+                    created_at: 1,
+                    updated_at: 2,
+                },
+            }),
+        })?;
+
+        let goal_meta = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let notifications = client.notifications.lock().unwrap();
+                    let found =
+                        notifications
+                            .iter()
+                            .find_map(|notification| match &notification.update {
+                                SessionUpdate::AgentMessageChunk(ContentChunk {
+                                    content: ContentBlock::Text(TextContent { text, .. }),
+                                    meta: Some(meta),
+                                    ..
+                                }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).cloned(),
+                                _ => None,
+                            });
+                    if let Some(meta) = found {
+                        break meta;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected an anyharness-tagged goal notification chunk");
+        drop(message_tx);
+
+        assert_eq!(goal_meta["transcriptEvent"], "goal_met");
+        assert_eq!(goal_meta["goal"]["status"], "met");
+        assert_eq!(goal_meta["goal"]["nativeStatus"], "complete");
+        assert_eq!(goal_meta["goal"]["tokensUsed"], 90);
+
+        Ok(())
+    }
+
+    /// Goal-engine continuation turns run without an ACP `session/prompt`
+    /// submission (see `register_engine_initiated_submission`). Their
+    /// transcript content and approval requests must still reach the
+    /// client instead of being dropped as "unknown submission ID", and the
+    /// approval decision must round-trip back into a real
+    /// `Op::ExecApproval` submission.
+    #[tokio::test]
+    async fn test_engine_initiated_turn_forwards_transcript_and_approvals() -> anyhow::Result<()> {
+        let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
+
+        // Note: no `ThreadMessage::Prompt` is ever sent for this id, mirroring
+        // a goal continuation turn that codex-core starts internally with a
+        // fresh sub_id the ACP layer never registered.
+        let turn_id = "goal-continuation-turn".to_string();
+
+        conversation.op_tx.send(Event {
+            id: turn_id.clone(),
+            msg: EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
+                thread_id: turn_id.clone(),
+                turn_id: turn_id.clone(),
+                item_id: turn_id.clone(),
+                delta: "continuation work".to_string(),
+            }),
+        })?;
+
+        conversation.op_tx.send(Event {
+            id: turn_id.clone(),
+            msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                call_id: "call-id".to_string(),
+                approval_id: Some("approval-id".to_string()),
+                turn_id: turn_id.clone(),
+                environment_id: None,
+                started_at_ms: 0,
+                command: vec!["echo".to_string(), "hi".to_string()],
+                cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                reason: None,
+                network_approval_context: None,
+                proposed_execpolicy_amendment: None,
+                proposed_network_policy_amendments: None,
+                additional_permissions: None,
+                available_decisions: Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "echo hi".to_string(),
+                }],
+            }),
+        })?;
+
+        // The continuation turn's assistant content must be forwarded, not
+        // dropped.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let notifications = client.notifications.lock().unwrap();
+                    let found = notifications.iter().any(|notification| {
+                        matches!(
+                            &notification.update,
+                            SessionUpdate::AgentMessageChunk(ContentChunk {
+                                content: ContentBlock::Text(TextContent { text, .. }),
+                                ..
+                            }) if text == "continuation work"
+                        )
+                    });
+                    if found {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("engine-initiated turn content should be forwarded to the client");
+
+        // The approval request must reach the client instead of wedging in
+        // codex-core because codex-acp never answers it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !client.permission_requests.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("engine-initiated turn approval request should reach the client");
+
+        // The (stubbed, auto-cancelled) permission response must round-trip
+        // back into a real `Op::ExecApproval`, proving the synthetic
+        // submission was registered under the turn's id so
+        // `PermissionRequestResolved` routing finds it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if conversation
+                    .ops
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|op| matches!(op, Op::ExecApproval { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval resolution should round-trip into an Op::ExecApproval submission");
+
+        drop(message_tx);
 
         Ok(())
     }
@@ -5824,6 +6145,35 @@ mod tests {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Re-loading an already-open session registers the new client, then the
+    /// sessions-map insert drops the evicted thread. The superseded thread's
+    /// cleanup must not remove the replacement registration, or every
+    /// subsequent goal event for the session is silently dropped.
+    #[test]
+    fn goal_registry_drop_of_superseded_registration_keeps_replacement() {
+        let registry = GoalNotificationRegistry::new();
+        let session_id = SessionId::new("test");
+        let client_a = SessionClient::with_client(
+            session_id.clone(),
+            Arc::new(StubClient::new()),
+            Arc::default(),
+        );
+        let client_b = SessionClient::with_client(
+            session_id.clone(),
+            Arc::new(StubClient::new()),
+            Arc::default(),
+        );
+        let token_a = registry.register(session_id.clone(), client_a);
+        let token_b = registry.register(session_id.clone(), client_b);
+        registry.unregister(&session_id, token_a);
+        assert!(
+            registry.client_for(&session_id).is_some(),
+            "superseded drop removed the live registration"
+        );
+        registry.unregister(&session_id, token_b);
+        assert!(registry.client_for(&session_id).is_none());
     }
 
     async fn setup() -> anyhow::Result<(
@@ -6902,6 +7252,9 @@ mod tests {
             thread: conversation.clone(),
             message_tx,
             _handle: handle,
+            goal_registry: GoalNotificationRegistry::new(),
+            session_id: session_id.clone(),
+            goal_registry_token: 0,
         };
 
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();

@@ -1,5 +1,9 @@
 //! Codex ACP - An Agent Client Protocol implementation for Codex.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+// The ACP request-handler builder plus the goal extension wiring produce a
+// deeply nested async state machine whose type-layout query exceeds the
+// default recursion limit (128).
+#![recursion_limit = "256"]
 
 use agent_client_protocol::ByteStreams;
 use codex_core::config::{Config, ConfigOverrides};
@@ -10,6 +14,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
+mod goals;
 mod thread;
 
 /// Run the Codex ACP agent.
@@ -44,7 +49,7 @@ pub async fn run_main(
         ..ConfigOverrides::default()
     };
 
-    let config =
+    let mut config =
         Config::load_with_cli_overrides_and_harness_overrides(cli_kv_overrides, config_overrides)
             .await
             .map_err(|e| {
@@ -53,6 +58,12 @@ pub async fn run_main(
                     format!("error loading config: {e}"),
                 )
             })?;
+    // Force-enable the goals feature: the anyharness runtime drives goals
+    // through the `_anyharness/goal/*` ext methods and expects the gate to be
+    // open regardless of user config.
+    if let Err(e) = config.features.enable(codex_features::Feature::Goals) {
+        tracing::warn!("failed to force-enable goals feature: {e}");
+    }
     // Apply residency requirement so the HTTP client sends the
     // x-openai-internal-codex-residency header on all requests.
     codex_login::default_client::set_default_client_residency_requirement(
