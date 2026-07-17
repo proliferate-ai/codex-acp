@@ -96,6 +96,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+#[path = "thread/native_subagents.rs"]
+mod native_subagents;
+use native_subagents::NativeSubagentState;
+
 /// Abstraction over the ACP connection for sending notifications and requests
 /// back to the client. This replaces the old `Client` trait usage.
 trait ClientSender: Send + Sync + 'static {
@@ -3608,6 +3612,10 @@ struct ThreadActor<A> {
     last_sent_config_options: Option<Vec<SessionConfigOption>>,
     /// Collaboration preset applied independently of the approval/sandbox mode.
     active_collaboration_mask: Option<CollaborationModeMask>,
+    /// Session-scoped native collaboration identity and replay deduplication.
+    /// This deliberately outlives each prompt so a child spawned in one turn
+    /// remains nested under the same parent during later turns and after load.
+    native_subagents: NativeSubagentState,
 }
 
 impl<A: Auth> ThreadActor<A> {
@@ -3635,6 +3643,7 @@ impl<A: Auth> ThreadActor<A> {
             resolution_rx,
             last_sent_config_options: None,
             active_collaboration_mask,
+            native_subagents: NativeSubagentState::default(),
         }
     }
 
@@ -4395,6 +4404,9 @@ impl<A: Auth> ThreadActor<A> {
     /// Convert and send an EventMsg as ACP notification(s) during replay.
     /// Handles messages and reasoning - mirrors the live event handling in PromptState.
     fn replay_event_msg(&mut self, msg: &EventMsg) {
+        if self.native_subagents.handle_event(&self.client, msg) {
+            return;
+        }
         match msg {
             EventMsg::TurnStarted(TurnStartedEvent {
                 collaboration_mode_kind,
@@ -4576,7 +4588,13 @@ impl<A: Auth> ThreadActor<A> {
 
     /// Convert and send a single ResponseItem as ACP notification(s) during replay.
     /// Only handles tool calls - messages/reasoning are handled via EventMsg.
-    fn replay_response_item(&self, item: &ResponseItem) {
+    fn replay_response_item(&mut self, item: &ResponseItem) {
+        if self
+            .native_subagents
+            .handle_response_item(&self.client, item)
+        {
+            return;
+        }
         match item {
             // Skip Message and Reasoning - these are handled via EventMsg
             ResponseItem::Message { .. } | ResponseItem::Reasoning { .. } => {}
@@ -4736,6 +4754,10 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_event(&mut self, Event { id, msg }: Event) {
+        if self.native_subagents.handle_event(&self.client, &msg) {
+            return;
+        }
+
         if let EventMsg::TurnStarted(TurnStartedEvent {
             collaboration_mode_kind,
             ..
