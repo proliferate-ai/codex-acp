@@ -1,6 +1,6 @@
 [package]
 name = "codex-acp"
-version = "0.18.2-proliferate.1"
+version = "0.18.3-proliferate.1"
 edition = "2024"
 authors = ["Proliferate"]
 license = "Apache-2.0"
