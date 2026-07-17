@@ -249,7 +249,10 @@ mod tests {
         use codex_protocol::protocol::ThreadGoalStatus as S;
         assert_eq!(normalize_protocol_status(S::Active), ("active", "active"));
         assert_eq!(normalize_protocol_status(S::Paused), ("paused", "paused"));
-        assert_eq!(normalize_protocol_status(S::Blocked), ("blocked", "blocked"));
+        assert_eq!(
+            normalize_protocol_status(S::Blocked),
+            ("blocked", "blocked")
+        );
         assert_eq!(
             normalize_protocol_status(S::UsageLimited),
             ("failed", "usageLimited")
@@ -295,12 +298,18 @@ mod tests {
 
     #[test]
     fn wire_methods_match_and_parse() {
-        assert!(AnyharnessGoalRequest::matches_method("_anyharness/goal/set"));
-        assert!(AnyharnessGoalRequest::matches_method("_anyharness/goal/get"));
+        assert!(AnyharnessGoalRequest::matches_method(
+            "_anyharness/goal/set"
+        ));
+        assert!(AnyharnessGoalRequest::matches_method(
+            "_anyharness/goal/get"
+        ));
         assert!(AnyharnessGoalRequest::matches_method(
             "_anyharness/goal/clear"
         ));
-        assert!(!AnyharnessGoalRequest::matches_method("anyharness/goal/set"));
+        assert!(!AnyharnessGoalRequest::matches_method(
+            "anyharness/goal/set"
+        ));
         assert!(!AnyharnessGoalRequest::matches_method("session/prompt"));
 
         let parsed = AnyharnessGoalRequest::parse_message(

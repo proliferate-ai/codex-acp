@@ -72,10 +72,9 @@ use codex_protocol::{
         NetworkPolicyRuleAction, Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus,
         PatchApplyUpdatedEvent, ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent,
         ReviewDecision, ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem,
-        StreamErrorEvent, TerminalInteractionEvent,
-        ThreadSettingsOverrides, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
-        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        StreamErrorEvent, TerminalInteractionEvent, ThreadSettingsOverrides, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -609,6 +608,9 @@ impl Drop for Thread {
 }
 
 impl Thread {
+    // This constructor assembles the actor's runtime dependencies explicitly;
+    // grouping them would only move the same coupling into an opaque bag.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         thread: Arc<dyn CodexThreadImpl>,
@@ -3468,7 +3470,10 @@ impl SessionClient {
     /// reached its terminal complete state).
     fn send_goal_transcript_event(&self, goal: &codex_protocol::protocol::ThreadGoal) {
         let wire = GoalWire::from_protocol(goal);
-        self.send_notification(goal_notification_update(wire.transcript_event(), Some(&wire)));
+        self.send_notification(goal_notification_update(
+            wire.transcript_event(),
+            Some(&wire),
+        ));
     }
 
     // TODO: re-wire transient status events (0.16 port gap).
@@ -4753,7 +4758,9 @@ impl<A: Auth> ThreadActor<A> {
         // content, tool calls, and approval requests flow through the same
         // per-turn state machine (and permission-response routing) as a
         // normal turn, instead of being silently dropped.
-        info!("Registering synthetic submission for engine-initiated turn without an ACP submission: {id}");
+        info!(
+            "Registering synthetic submission for engine-initiated turn without an ACP submission: {id}"
+        );
         let client = self.client.clone();
         let submission = self.register_engine_initiated_submission(id);
         submission.handle_event(&client, msg).await;
@@ -5310,16 +5317,17 @@ mod tests {
             loop {
                 {
                     let notifications = client.notifications.lock().unwrap();
-                    let found = notifications.iter().find_map(|notification| {
-                        match &notification.update {
-                            SessionUpdate::AgentMessageChunk(ContentChunk {
-                                content: ContentBlock::Text(TextContent { text, .. }),
-                                meta: Some(meta),
-                                ..
-                            }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).cloned(),
-                            _ => None,
-                        }
-                    });
+                    let found =
+                        notifications
+                            .iter()
+                            .find_map(|notification| match &notification.update {
+                                SessionUpdate::AgentMessageChunk(ContentChunk {
+                                    content: ContentBlock::Text(TextContent { text, .. }),
+                                    meta: Some(meta),
+                                    ..
+                                }) if text.is_empty() => meta.get(ANYHARNESS_META_KEY).cloned(),
+                                _ => None,
+                            });
                     if let Some(meta) = found {
                         break meta;
                     }
@@ -5346,8 +5354,7 @@ mod tests {
     /// approval decision must round-trip back into a real
     /// `Op::ExecApproval` submission.
     #[tokio::test]
-    async fn test_engine_initiated_turn_forwards_transcript_and_approvals() -> anyhow::Result<()>
-    {
+    async fn test_engine_initiated_turn_forwards_transcript_and_approvals() -> anyhow::Result<()> {
         let (_session_id, client, conversation, message_tx, _handle) = setup().await?;
 
         // Note: no `ThreadMessage::Prompt` is ever sent for this id, mirroring
