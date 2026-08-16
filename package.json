@@ -1,9 +1,9 @@
 {
-  "name": "@agentclientprotocol/codex-acp",
+  "name": "@proliferate/codex-acp",
   "publishConfig": {
     "access": "public"
   },
-  "version": "1.1.14",
+  "version": "1.1.14-proliferate.1",
   "description": "",
   "main": "dist/index.js",
   "bin": {
@@ -40,7 +40,8 @@
     "test:e2e": "npm run build && RUN_E2E_TESTS=true vitest run src/__tests__/CodexACPAgent/e2e",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit && tsc --noEmit -p examples/tsconfig.json",
-    "codex-test": "tsx .claude/skills/run-codex/scripts/run-codex-test.ts"
+    "codex-test": "tsx .claude/skills/run-codex/scripts/run-codex-test.ts",
+    "prepare": "node build.mjs"
   },
   "homepage": "https://github.com/agentclientprotocol/codex-acp#readme",
   "bugs": {
