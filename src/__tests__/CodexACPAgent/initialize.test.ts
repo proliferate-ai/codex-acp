@@ -49,6 +49,9 @@ describe('CodexACPAgent - initialize', () => {
                 },
                 sessionCapabilities: {
                     resume: {},
+                    // AnyHarness delta: session/fork registered (mapped to App
+                    // Server thread/fork). Canonical codex-acp omits this.
+                    fork: {},
                     list: {},
                     close: {},
                     delete: {},

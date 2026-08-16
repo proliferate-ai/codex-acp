@@ -9,6 +9,7 @@ import {
 import type {EmbeddedResourceResource} from "@agentclientprotocol/sdk";
 import * as acp from "@agentclientprotocol/sdk";
 import {type McpServer, RequestError} from "@agentclientprotocol/sdk";
+import {forkAnchorLastTurnId} from "./anyharness-fork";
 import type {
     ApprovalHandler,
     CodexAppServerClient,
@@ -407,6 +408,37 @@ export class CodexAcpClient {
             currentServiceTier: response.serviceTier as ServiceTier ?? null,
             additionalDirectories,
         }
+    }
+
+    /** AnyHarness delta: fork the source thread into a NEW thread via the App
+     *  Server `thread/fork`, anchored (inclusive) on `lastTurnId` when the ACP
+     *  request carries `_meta.anyharness.lastTurnId`; absent = tip fork. Returns
+     *  metadata keyed on the NEW forked thread id (`response.thread.id`), not the
+     *  source. Mirrors {@link resumeSession}. */
+    async forkSession(request: acp.ForkSessionRequest, onSubscribed?: () => void): Promise<SessionMetadata> {
+        const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
+        await this.refreshSkills(request.cwd, additionalDirectories);
+
+        const lastTurnId = forkAnchorLastTurnId(request._meta);
+        const response = await this.codexClient.threadFork({
+            config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
+            cwd: request.cwd,
+            modelProvider: await this.getResumeModelProvider(),
+            threadId: request.sessionId,
+            ...(lastTurnId !== undefined && { lastTurnId }),
+        });
+        onSubscribed?.();
+        const codexModels = await this.fetchAvailableModels();
+        const currentModelId = this.createModelId(codexModels, response.model, response.reasoningEffort).toString();
+        return {
+            sessionId: response.thread.id,
+            currentModelId: currentModelId,
+            models: codexModels,
+            collaborationMode: this.getCollaborationMode(response.thread.id),
+            modelProvider: response.modelProvider,
+            currentServiceTier: response.serviceTier as ServiceTier ?? null,
+            additionalDirectories,
+        };
     }
 
     async loadSession(request: acp.LoadSessionRequest, onSubscribed?: () => void): Promise<SessionMetadataWithThread> {

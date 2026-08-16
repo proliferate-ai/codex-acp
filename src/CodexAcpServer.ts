@@ -49,6 +49,7 @@ import {
     LEGACY_GOAL_CONTROL_METHOD,
     LEGACY_SET_SESSION_MODEL_METHOD,
     type LegacyLoadSessionResponse,
+    type LegacyForkSessionResponse,
     type LegacyNewSessionResponse,
     type LegacyResumeSessionResponse,
     type LegacySessionModelState,
@@ -149,6 +150,12 @@ interface ActivePrompt {
     complete: () => void;
 }
 
+/** Presence of this object routes {@link CodexAcpServer.getOrCreateSession} to
+ *  the fork path (App Server `thread/fork`) instead of resume/start. The
+ *  inclusive `lastTurnId` anchor itself travels on the request `_meta`
+ *  (`_meta.anyharness.lastTurnId`), read in `CodexAcpClient.forkSession`. */
+type ForkOptions = Record<string, never>;
+
 export class CodexAcpServer {
     private static readonly MODEL_NAME_TOKEN_OVERRIDES: Record<string, string> = {
         gpt: "GPT",
@@ -238,6 +245,11 @@ export class CodexAcpServer {
                 },
                 sessionCapabilities: {
                     resume: { },
+                    // AnyHarness delta: `session/fork` mapped to App Server
+                    // `thread/fork` (inclusive `lastTurnId` anchor via
+                    // `_meta.anyharness.lastTurnId`). Canonical codex-acp does
+                    // not register fork; absence of this cap means unpatched.
+                    fork: { },
                     list: { },
                     close: { },
                     delete: { },
@@ -359,9 +371,12 @@ export class CodexAcpServer {
         }
     }
 
-    async getOrCreateSession(request: acp.NewSessionRequest | acp.ResumeSessionRequest): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
+    async getOrCreateSession(
+        request: acp.NewSessionRequest | acp.ResumeSessionRequest | acp.ForkSessionRequest,
+        forkOptions?: ForkOptions,
+    ): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
         try {
-            return await this.tryCreateSession(request);
+            return await this.tryCreateSession(request, forkOptions);
         } catch (e) {
             const error = e instanceof Error ? e : new Error(String(e));
             await this.handleError(error);
@@ -450,8 +465,14 @@ export class CodexAcpServer {
         return generation;
     }
 
-    async tryCreateSession(request: acp.NewSessionRequest | acp.ResumeSessionRequest): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
-        const requestedSessionGeneration = "sessionId" in request
+    async tryCreateSession(
+        request: acp.NewSessionRequest | acp.ResumeSessionRequest | acp.ForkSessionRequest,
+        forkOptions?: ForkOptions,
+    ): Promise<[SessionId, LegacySessionModelState, SessionModeState]> {
+        // A fork installs under a NEW thread id (returned by the App Server),
+        // so — like a brand-new session — its session-open generation must be
+        // begun on that new id below (line ~495), NOT on the source id here.
+        const requestedSessionGeneration = "sessionId" in request && !forkOptions
             ? this.beginSessionOpen(request.sessionId)
             : null;
         await this.checkAuthorization();
@@ -462,7 +483,17 @@ export class CodexAcpServer {
 
         let sessionMetadata: SessionMetadata;
         let resumeSubscribed = false;
-        if ("sessionId" in request) {
+        if (forkOptions) {
+            // AnyHarness delta: fork the source thread into a NEW thread. The
+            // returned metadata is keyed on the forked thread id, so the generic
+            // registration tail below installs the new session, not the source.
+            // Generation is begun on the new id (like a new session), so no
+            // source-id session-open cleanup is owed on failure.
+            logger.log(`Fork existing session: ${(request as acp.ForkSessionRequest).sessionId}...`);
+            sessionMetadata = await this.runWithProcessCheck(() =>
+                this.codexAcpClient.forkSession(request as acp.ForkSessionRequest)
+            );
+        } else if ("sessionId" in request) {
             logger.log(`Resume existing session: ${request.sessionId}...`);
             try {
                 sessionMetadata = await this.runWithProcessCheck(() =>
@@ -612,6 +643,23 @@ export class CodexAcpServer {
             availableModelCount: modelState.availableModels.length
         });
         return {
+            models: modelState,
+            modes: modeState,
+            ...this.createSessionConfigOptionsResponse(this.getSessionState(sessionId)),
+        };
+    }
+
+    async unstable_forkSession(params: acp.ForkSessionRequest): Promise<LegacyForkSessionResponse> {
+        logger.log("Forking session...", {sessionId: params.sessionId});
+        const [sessionId, modelState, modeState] = await this.getOrCreateSession(params, {});
+        logger.log("Session forked", {
+            sourceSessionId: params.sessionId,
+            sessionId: sessionId,
+            modelId: modelState.currentModelId,
+            availableModelCount: modelState.availableModels.length,
+        });
+        return {
+            sessionId,
             models: modelState,
             modes: modeState,
             ...this.createSessionConfigOptionsResponse(this.getSessionState(sessionId)),
