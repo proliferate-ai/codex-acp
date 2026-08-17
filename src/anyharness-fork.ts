@@ -19,6 +19,33 @@ import { RequestError } from "@agentclientprotocol/sdk";
  *  sin). */
 export const ANYHARNESS_META_NAMESPACE = "anyharness";
 
+/** Version of the `_meta.anyharness` extension schema this adapter speaks. */
+export const ANYHARNESS_SCHEMA_VERSION = 1;
+
+/** The versioned targeted-fork capability advertisement, attached as the
+ *  `_meta` of `sessionCapabilities.fork` in the initialize response.
+ *
+ *  The exact shape is a wire contract with the AnyHarness runtime probe
+ *  `has_anyharness_targeted_fork_extension`
+ *  (anyharness-lib/src/live/sessions/driver/native_session.rs), which requires
+ *  `anyharness.schemaVersion == 1` and
+ *  `anyharness.targetedFork.fileEffects == "none"` plus a recognized
+ *  `targetedFork.target`. Codex anchors forks by TURN id
+ *  (`ThreadForkParams.lastTurnId`, inclusive), so `target` is `"turn_id"`:
+ *  the runtime resolves its message-granular boundary to the native turn
+ *  immediately preceding the boundary and sends that turn's id. `fileEffects`
+ *  is `"none"` because `thread/fork` copies conversation history only — it
+ *  never mutates or reverts workspace files. */
+export const ANYHARNESS_TARGETED_FORK_CAPABILITY_META = {
+  [ANYHARNESS_META_NAMESPACE]: {
+    schemaVersion: ANYHARNESS_SCHEMA_VERSION,
+    targetedFork: {
+      fileEffects: "none",
+      target: "turn_id",
+    },
+  },
+} as const;
+
 export function forkAnchorLastTurnId(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") return undefined;
   const ns = (meta as Record<string, unknown>)[ANYHARNESS_META_NAMESPACE];

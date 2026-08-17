@@ -37,6 +37,7 @@ import type {TokenCount} from "./TokenCount";
 import {toPromptUsage} from "./TokenCount";
 import {CodexCommands, GOAL_CONTINUATION_PROMPT} from "./CodexCommands";
 import {SteeringQueue} from "./SteeringQueue";
+import {ANYHARNESS_TARGETED_FORK_CAPABILITY_META} from "./anyharness-fork";
 import type {QuotaMeta} from "./QuotaMeta";
 import {logger} from "./Logger";
 import {sanitizeMcpServerName} from "./McpServerName";
@@ -249,7 +250,10 @@ export class CodexAcpServer {
                     // `thread/fork` (inclusive `lastTurnId` anchor via
                     // `_meta.anyharness.lastTurnId`). Canonical codex-acp does
                     // not register fork; absence of this cap means unpatched.
-                    fork: { },
+                    // The `_meta` is the versioned targeted-fork advertisement
+                    // consumed by the AnyHarness runtime probe (see
+                    // anyharness-fork.ts for the wire contract).
+                    fork: { _meta: ANYHARNESS_TARGETED_FORK_CAPABILITY_META },
                     list: { },
                     close: { },
                     delete: { },

@@ -50,8 +50,19 @@ describe('CodexACPAgent - initialize', () => {
                 sessionCapabilities: {
                     resume: {},
                     // AnyHarness delta: session/fork registered (mapped to App
-                    // Server thread/fork). Canonical codex-acp omits this.
-                    fork: {},
+                    // Server thread/fork), with the versioned targeted-fork
+                    // advertisement in `_meta`. Canonical codex-acp omits this.
+                    fork: {
+                        _meta: {
+                            anyharness: {
+                                schemaVersion: 1,
+                                targetedFork: {
+                                    fileEffects: "none",
+                                    target: "turn_id",
+                                },
+                            },
+                        },
+                    },
                     list: {},
                     close: {},
                     delete: {},

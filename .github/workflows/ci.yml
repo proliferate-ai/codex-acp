@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # canonical-1.1.14-base is the AnyHarness fork line; PRs onto it need the
+    # same typecheck/test/bundle gate as main.
+    branches: [main, canonical-1.1.14-base]
 
 permissions: {}
 
