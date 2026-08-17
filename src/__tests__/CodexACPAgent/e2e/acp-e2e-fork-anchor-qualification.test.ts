@@ -290,18 +290,18 @@ describeE2E("Fork anchor qualification (pinned upstream @openai/codex 0.147.0)",
             const sourceTurnIds = [firstTurnId, secondTurnId, thirdTurnId];
             const containsAllSourceTurns = sourceTurnIds.every((turnId) => forkedTurnIds.includes(turnId));
 
-            if (containsAllSourceTurns && forkedTurnIds.length > 0) {
-                expect(
-                    containsAllSourceTurns,
-                    "SILENT FULL COPY: upstream forked the full thread on an unknown lastTurnId — adapter pre-validation required (Forks ADR §5 cardinal sin)",
-                ).toBe(false);
-            } else {
-                // Pinned: upstream 0.147.0 returns an empty/zero-turn fork
-                // for an unknown lastTurnId instead of erroring or silently
-                // full-copying.
-                console.info(`[qualification] Q-B3 unknown lastTurnId ${unknownLastTurnId}: accepted with ${forkedTurnIds.length} turns copied`);
-                expect(forkedTurnIds.length).toBe(0);
-            }
+            // Any non-error outcome on an unknown anchor is a silent failure:
+            // a full copy is the Forks ADR §5 cardinal sin (silent tip
+            // downgrade) and an empty/partial fork is the same sin in the
+            // opposite direction (silent content loss). Either way adapter
+            // pre-validation of the turn id before dispatch becomes
+            // mandatory.
+            console.info(`[qualification] Q-B3 unknown lastTurnId ${unknownLastTurnId}: ACCEPTED with ${forkedTurnIds.length} turns copied (full copy: ${containsAllSourceTurns})`);
+            expect.unreachable(
+                containsAllSourceTurns
+                    ? "SILENT FULL COPY: upstream forked the full thread on an unknown lastTurnId — adapter pre-validation required (Forks ADR §5 cardinal sin)"
+                    : `SILENT PARTIAL/EMPTY FORK: upstream accepted an unknown lastTurnId and copied ${forkedTurnIds.length} turns — adapter pre-validation required (silent content loss)`,
+            );
         }
     }, 60_000);
 });
